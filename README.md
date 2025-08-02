@@ -4,12 +4,31 @@ Convert any OS to Talos Linux
 
 ## Installation
 
+Download binary from Github [releases page](https://github.com/cozystack/boot-to-talos/releases/latest)
+
+Or use simple script to install it:
+```bash
+curl -sSL https://github.com/cozystack/boot-to-talos/raw/refs/heads/main/hack/install.sh | sh -s
+```
+
 ### Download a pre‑built release binary
 
 Head over to [https://github.com/cozystack/boot-to-talos/releases](https://github.com/cozystack/boot-to-talos/releases), grab the archive for your OS/arch, unpack it somewhere on your `$PATH`.
+
+
+## Installation
+
+Download binary from Github [releases page](https://github.com/cozystack/talm/releases/latest)
+
+Or use simple script to install it:
+```bash
+curl -sSL https://github.com/cozystack/talm/raw/refs/heads/main/hack/install.sh | sh -s
+```
+
 ## Example usage
 
 ```console
+$ boot-to-talos
 Target disk [/dev/sda]:
 Talos installer image [ghcr.io/cozystack/cozystack/talos:v1.10.5]:
 Add networking configuration? [yes]:
