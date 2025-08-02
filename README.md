@@ -1,6 +1,13 @@
 # boot-to-talos
 
-Convert any OS to Talos Linux
+Convert any OS to Talos Linux — completely from userspace, no external dependencies except the Talos installer image.
+
+## How it works
+
+1. **Unpack in RAM** – layers from the Talos‑installer container are extracted into a throw‑away `tmpfs`; no Docker needed.
+2. **Build system image** – a sparse `image.raw` is created, exposed via a loop device, and the Talos *installer* is executed inside a chroot; it partitions, formats and lays down GRUB + system files.
+3. **Stream to disk** – the program copies `image.raw` to the chosen block device in 4 MiB chunks and `fsync`s after every write, so data is fully committed before reboot.
+4. **Reboot** – `echo b > /proc/sysrq-trigger` performs an immediate reboot into the freshly flashed Talos Linux.
 
 ## Installation
 
@@ -9,20 +16,6 @@ Download binary from Github [releases page](https://github.com/cozystack/boot-to
 Or use simple script to install it:
 ```bash
 curl -sSL https://github.com/cozystack/boot-to-talos/raw/refs/heads/main/hack/install.sh | sh -s
-```
-
-### Download a pre‑built release binary
-
-Head over to [https://github.com/cozystack/boot-to-talos/releases](https://github.com/cozystack/boot-to-talos/releases), grab the archive for your OS/arch, unpack it somewhere on your `$PATH`.
-
-
-## Installation
-
-Download binary from Github [releases page](https://github.com/cozystack/talm/releases/latest)
-
-Or use simple script to install it:
-```bash
-curl -sSL https://github.com/cozystack/talm/raw/refs/heads/main/hack/install.sh | sh -s
 ```
 
 ## Example usage
