@@ -418,9 +418,13 @@ cluster:
 	}
 	log.Print("Talos installer finished successfully")
 
+	log.Print("remounting all filesystems read-only")
+	os.WriteFile("/proc/sysrq-trigger", []byte("u"), 0)
+
 	copyWithFsync(raw, diskFlag)
 	log.Printf("installation image copied to %s", diskFlag)
 
+	log.Print("rebooting system")
 	os.WriteFile("/proc/sysrq-trigger", []byte("b"), 0)
 }
 
