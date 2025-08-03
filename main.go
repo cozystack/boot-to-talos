@@ -210,16 +210,22 @@ func prettyName(name string) string {
 		return name
 	}
 	p := fmt.Sprintf("/run/udev/data/n%d", ifc.Index)
-	b, err := os.ReadFile(p)
+
+	data, err := os.ReadFile(p)
 	if err != nil {
 		return name
 	}
-	for _, l := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(l, "ID_NET_NAME_ONBOARD=") {
-			return strings.TrimPrefix(l, "ID_NET_NAME_ONBOARD=")
+	for _, l := range strings.Split(string(data), "\n") {
+		if i := strings.IndexByte(l, ':'); i >= 0 {
+			l = l[i+1:]
 		}
-		if strings.HasPrefix(l, "ID_NET_NAME_PATH=") {
+		switch {
+		case strings.HasPrefix(l, "ID_NET_NAME_ONBOARD="):
+			return strings.TrimPrefix(l, "ID_NET_NAME_ONBOARD=")
+		case strings.HasPrefix(l, "ID_NET_NAME_PATH="):
 			return strings.TrimPrefix(l, "ID_NET_NAME_PATH=")
+		case strings.HasPrefix(l, "ID_NET_NAME_SLOT="):
+			return strings.TrimPrefix(l, "ID_NET_NAME_SLOT=")
 		}
 	}
 	return name
