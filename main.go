@@ -12,6 +12,8 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,8 +315,11 @@ func main() {
 	instDir := filepath.Join(tmpDir, "installer")
 	os.MkdirAll(instDir, 0o755)
 
+	transport := setupTransportWithProxy()
+	opts := crane.WithTransport(transport)
+
 	log.Printf("pulling image %s", imageFlag)
-	img, err := crane.Pull(imageFlag)
+	img, err := crane.Pull(imageFlag, opts)
 	must("pull image", err)
 
 	log.Print("extracting image layers")
@@ -453,4 +458,24 @@ func setupLoop(path string) (string, *os.File) {
 		log.Fatalf("LOOP_SET_STATUS64: %v", errno)
 	}
 	return loop, lf
+}
+
+/* ---------------- setup transport that respects proxy settings -------------------------------------- */
+func setupTransportWithProxy() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		proxyURL, err := http.ProxyFromEnvironment(req)
+		if err != nil {
+			log.Printf("Warning: error reading proxy settings: %v", err)
+			return nil, nil // Fallback to direct connection on error.
+		}
+
+		if proxyURL != nil {
+			log.Printf("Using proxy: %s", proxyURL.String())
+		} else {
+			log.Printf("No proxy configured, using direct connection")
+		}
+		return proxyURL, nil
+	}
+	return transport
 }
