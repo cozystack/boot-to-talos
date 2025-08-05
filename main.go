@@ -34,12 +34,14 @@ func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 var (
 	imageFlag string
 	diskFlag  string
+	yesFlag   bool
 )
 
 func init() {
 	flag.StringVar(&imageFlag, "image",
 		"ghcr.io/cozystack/cozystack/talos:v1.10.5", "Talos installer image")
 	flag.StringVar(&diskFlag, "disk", "", "target disk (will be wiped)")
+	flag.BoolVar(&yesFlag, "yes", false, "automatic yes to prompts")
 }
 
 /* ------------------------------ helpers ----------------------------------- */
@@ -96,6 +98,10 @@ func fakeCert() string {
 var reader = bufio.NewReader(os.Stdin)
 
 func ask(msg, def string) string {
+	if yesFlag {
+		fmt.Printf("%s [%s]: %s\n", msg, def, def)
+		return def
+	}
 	fmt.Printf("%s [%s]: ", msg, def)
 	t, _ := reader.ReadString('\n')
 	t = strings.TrimSpace(t)
@@ -106,6 +112,9 @@ func ask(msg, def string) string {
 }
 
 func askRequired(msg string) string {
+	if yesFlag {
+		log.Fatalf("missing required input for: %s (cannot auto-fill)", msg)
+	}
 	for {
 		fmt.Printf("%s: ", msg)
 		t, _ := reader.ReadString('\n')
@@ -117,6 +126,10 @@ func askRequired(msg string) string {
 }
 
 func askYesNo(msg string, def bool) bool {
+	if yesFlag {
+		fmt.Printf("%s [%s]: %v\n", msg, map[bool]string{true: "yes", false: "no"}[def], def)
+		return def
+	}
 	defStr := "yes"
 	if !def {
 		defStr = "no"
