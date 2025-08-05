@@ -69,6 +69,33 @@ Continue? [yes]:
 2025/08/03 00:11:19 rebooting system
 ```
 
+## Non-interactive installation
+
+You can run `boot-to-talos` in fully automated mode by passing the required flags.  
+To skip all interactive prompts, use the `-yes` flag:
+
+```console
+boot-to-talos -yes
+```
+
+You can also specify all parameters explicitly:
+
+```console
+boot-to-talos -yes -disk /dev/sda -image ghcr.io/cozystack/cozystack/talos:v1.10.5 -image-size-gib 4 -extra-kernel-arg "console=ttyS0"
+```
+
+## Available command-line flags
+
+| Flag                  | Description                                                        | Example                                         |
+|-----------------------|--------------------------------------------------------------------|-------------------------------------------------|
+| `-yes`                | Run non-interactively, do not ask for confirmation                 | `-yes`                                          |
+| `-disk string`        | Target disk (will be wiped)                                        | `-disk /dev/sda`                                |
+| `-image string`       | Talos installer image (default: `ghcr.io/cozystack/cozystack/talos:v1.10.5`) | `-image ghcr.io/cozystack/cozystack/talos:v1.10.5` |
+| `-image-size-gib uint`| Size of image.raw in GiB (default: 2)                              | `-image-size-gib 4`                             |
+| `-extra-kernel-arg value` | Extra kernel argument (can be repeated)                        | `-extra-kernel-arg "console=ttyS0"`             |
+
+**Tip:** All flags can be combined. If a flag is not provided, the installer will prompt for input (unless `-yes` is used).
+
 ---
 
 Created for the Cozystack project. 🚀
