@@ -22,8 +22,12 @@ curl -sSL https://github.com/cozystack/boot-to-talos/raw/refs/heads/main/hack/in
 
 ```console
 $ boot-to-talos
-Target disk [/dev/sda]:
+Mode:
+  1. boot – extract the kernel and initrd from the Talos installer and boot them directly using the kexec mechanism.
+  2. install – prepare the environment, run the Talos installer, and then overwrite the system disk with the installed image.
+Mode [1]: 2
 Talos installer image [ghcr.io/cozystack/cozystack/talos:v1.10.5]:
+Target disk [/dev/sda]:
 Add networking configuration? [yes]:
 Interface [eth0]:
 IP address [10.0.2.15]:

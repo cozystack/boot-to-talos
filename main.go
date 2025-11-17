@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/tar"
 	"bufio"
 	"crypto/rand"
 	"encoding/base64"
@@ -17,10 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unsafe"
 
-	"github.com/google/go-containerregistry/pkg/crane"
 	"golang.org/x/sys/unix"
 )
 
@@ -35,6 +32,7 @@ var (
 	imageFlag string
 	diskFlag  string
 	yesFlag   bool
+	modeFlag  string
 )
 
 func init() {
@@ -42,6 +40,8 @@ func init() {
 		"ghcr.io/cozystack/cozystack/talos:v1.10.5", "Talos installer image")
 	flag.StringVar(&diskFlag, "disk", "", "target disk (will be wiped)")
 	flag.BoolVar(&yesFlag, "yes", false, "automatic yes to prompts")
+	flag.StringVar(&modeFlag, "mode", "", "mode: boot or install")
+	flag.StringVar(&modeFlag, "m", "", "mode: boot or install (shorthand)")
 }
 
 /* ------------------------------ helpers ----------------------------------- */
@@ -153,6 +153,31 @@ func askYesNo(msg string, def bool) bool {
 			return false
 		}
 		fmt.Println("Please answer 'yes' or 'no'.")
+	}
+}
+
+func askMode() string {
+	modeOptions := "Mode:\n" +
+		"  1. boot – extract the kernel and initrd from the Talos installer and boot them directly using the kexec mechanism.\n" +
+		"  2. install – prepare the environment, run the Talos installer, and then overwrite the system disk with the installed image."
+
+	if yesFlag {
+		fmt.Println(modeOptions)
+		fmt.Println("Mode [1]: boot")
+		return "boot"
+	}
+	for {
+		fmt.Println(modeOptions)
+		fmt.Print("Mode [1]: ")
+		in, _ := reader.ReadString('\n')
+		in = strings.TrimSpace(strings.ToLower(in))
+		if in == "" || in == "1" || in == "boot" || in == "kexec" {
+			return "boot"
+		}
+		if in == "2" || in == "install" {
+			return "install"
+		}
+		fmt.Println("Please enter '1' or '2' (or 'boot'/'install').")
 	}
 }
 
@@ -297,7 +322,22 @@ func main() {
 	flag.Var(&extra, "extra-kernel-arg", "extra kernel arg (repeatable)")
 	flag.Parse()
 
-	if diskFlag == "" {
+	// If mode is not specified, ask as first question
+	if modeFlag == "" {
+		modeFlag = askMode()
+	} else {
+		// Check validity of specified mode
+		if modeFlag != "boot" && modeFlag != "install" {
+			log.Fatalf("invalid mode: %s (must be 'boot' or 'install')", modeFlag)
+		}
+	}
+
+	if imageFlag == flag.Lookup("image").DefValue {
+		imageFlag = ask("Talos installer image", imageFlag)
+	}
+
+	// For install mode, ask for target disk after image selection
+	if modeFlag == "install" && diskFlag == "" {
 		def := firstDisk()
 		if def == "" {
 			diskFlag = askRequired("Target disk")
@@ -305,156 +345,20 @@ func main() {
 			diskFlag = ask("Target disk", def)
 		}
 	}
-	if imageFlag == flag.Lookup("image").DefValue {
-		imageFlag = ask("Talos installer image", imageFlag)
-	}
 
+	// Collect kernel args for both modes
 	for _, e := range collectKernelArgs() {
 		extra = append(extra, e)
 	}
 
-	fmt.Println("\nSummary:")
-	fmt.Printf("  Image: %s\n", imageFlag)
-	fmt.Printf("  Disk:  %s\n", diskFlag)
-	fmt.Printf("  Extra kernel args: %s\n",
-		func() string {
-			if len(extra) == 0 {
-				return "(none)"
-			}
-			return strings.Join(extra, " ")
-		}())
-	fmt.Printf("\nWARNING: ALL DATA ON %s WILL BE ERASED!\n\n", diskFlag)
-	if !askYesNo("Continue?", true) {
-		log.Fatal("aborted by user")
-	}
-	fmt.Println()
-
-	/* ---------- heavy work (logs will show progress) ---------- */
-
-	tmpDir, _ := os.MkdirTemp("", "installer-*")
-	log.Printf("created temporary directory %s", tmpDir)
-	defer os.RemoveAll(tmpDir)
-	must("mount tmpfs", unix.Mount("tmpfs", tmpDir, "tmpfs", 0, ""))
-
-	instDir := filepath.Join(tmpDir, "installer")
-	os.MkdirAll(instDir, 0o755)
-
-	transport := setupTransportWithProxy()
-	opts := crane.WithTransport(transport)
-
-	log.Printf("pulling image %s", imageFlag)
-	img, err := crane.Pull(imageFlag, opts)
-	must("pull image", err)
-
-	log.Print("extracting image layers")
-	layers, _ := img.Layers()
-	for _, l := range layers {
-		r, _ := l.Uncompressed()
-		defer r.Close()
-		tr := tar.NewReader(r)
-		for {
-			h, err := tr.Next()
-			if err == io.EOF {
-				break
-			}
-			must("tar", err)
-			if strings.HasPrefix(filepath.Base(h.Name), ".wh.") {
-				os.RemoveAll(filepath.Join(instDir,
-					filepath.Dir(h.Name),
-					strings.TrimPrefix(filepath.Base(h.Name), ".wh.")))
-				continue
-			}
-			target := filepath.Join(instDir, h.Name)
-			switch h.Typeflag {
-			case tar.TypeDir:
-				os.MkdirAll(target, os.FileMode(h.Mode))
-			case tar.TypeReg:
-				os.MkdirAll(filepath.Dir(target), 0o755)
-				f, _ := os.Create(target)
-				io.Copy(f, tr)
-				f.Close()
-				os.Chmod(target, os.FileMode(h.Mode))
-			case tar.TypeSymlink:
-				os.MkdirAll(filepath.Dir(target), 0o755)
-				os.Symlink(h.Linkname, target)
-			case tar.TypeLink:
-				os.Link(filepath.Join(instDir, h.Linkname), target)
-			case tar.TypeChar, tar.TypeBlock:
-				os.MkdirAll(filepath.Dir(target), 0o755)
-				dev := int(unix.Mkdev(uint32(h.Devmajor), uint32(h.Devminor)))
-				mode := uint32(h.Mode)
-				if h.Typeflag == tar.TypeChar {
-					mode |= unix.S_IFCHR
-				} else {
-					mode |= unix.S_IFBLK
-				}
-				unix.Mknod(target, mode, dev)
-			}
-		}
+	// If not installation mode, use boot
+	if modeFlag == "boot" {
+		runBootMode(imageFlag, extra)
+		return
 	}
 
-	raw := filepath.Join(tmpDir, "image.raw")
-	log.Printf("creating raw disk %s (%d GiB)", raw, *sizeGiB)
-	f, _ := os.Create(raw)
-	f.Truncate(int64(*sizeGiB) << 30)
-	f.Close()
-
-	loop, lf := setupLoop(raw)
-	log.Printf("attached %s to %s", raw, loop)
-	defer func() {
-		unix.Syscall(unix.SYS_IOCTL, lf.Fd(), unix.LOOP_CLR_FD, 0)
-		lf.Close()
-	}()
-
-	mountBind("/proc", filepath.Join(instDir, "proc"))
-	mountBindRecursive("/sys", filepath.Join(instDir, "sys"))
-	mountBind("/dev", filepath.Join(instDir, "dev"))
-	overrideCmdline(instDir, "talos.platform=metal "+strings.Join(extra, " "))
-
-	execPath := "/usr/bin/installer"
-	args := []string{execPath, "install", "--platform", "metal", "--disk", loop, "--force"}
-	for _, a := range extra {
-		args = append(args, "--extra-kernel-arg", a)
-	}
-
-	stdinR, stdinW, _ := os.Pipe()
-	go func() {
-		fmt.Fprintf(stdinW, `version: v1alpha1
-machine:
-  ca: {crt: %s}
-  install: {disk: /dev/sda}
-cluster:
-  controlPlane: {endpoint: https://localhost:6443}
-`, fakeCert())
-		stdinW.Close()
-	}()
-
-	attr := &syscall.ProcAttr{
-		Dir:   "/",
-		Env:   []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
-		Files: []uintptr{stdinR.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
-		Sys:   &syscall.SysProcAttr{Chroot: instDir},
-	}
-
-	log.Print("starting Talos installer")
-	pid, err := syscall.ForkExec(execPath, args, attr)
-	must("forkexec", err)
-	var ws syscall.WaitStatus
-	_, err = syscall.Wait4(pid, &ws, 0, nil)
-	must("wait", err)
-	if !ws.Exited() || ws.ExitStatus() != 0 {
-		log.Fatalf("installer exited %d", ws.ExitStatus())
-	}
-	log.Print("Talos installer finished successfully")
-
-	log.Print("remounting all filesystems read-only")
-	os.WriteFile("/proc/sysrq-trigger", []byte("u"), 0)
-
-	copyWithFsync(raw, diskFlag)
-	log.Printf("installation image copied to %s", diskFlag)
-
-	log.Print("rebooting system")
-	os.WriteFile("/proc/sysrq-trigger", []byte("b"), 0)
+	// Installation mode
+	runInstallMode(imageFlag, diskFlag, extra, *sizeGiB)
 }
 
 /* ---------------- loop util (local) -------------------------------------- */
