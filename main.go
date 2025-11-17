@@ -57,6 +57,11 @@ func mountBind(src, dst string) {
 	must("bind "+src, unix.Mount(src, dst, "", unix.MS_BIND, ""))
 }
 
+func mountBindRecursive(src, dst string) {
+	os.MkdirAll(dst, 0o755)
+	must("bind recursive "+src, unix.Mount(src, dst, "", unix.MS_BIND|unix.MS_REC, ""))
+}
+
 func overrideCmdline(root, content string) {
 	tmp := filepath.Join(root, "tmp", "cmdline")
 	os.MkdirAll(filepath.Dir(tmp), 0o755)
@@ -402,7 +407,7 @@ func main() {
 	}()
 
 	mountBind("/proc", filepath.Join(instDir, "proc"))
-	mountBind("/sys", filepath.Join(instDir, "sys"))
+	mountBindRecursive("/sys", filepath.Join(instDir, "sys"))
 	mountBind("/dev", filepath.Join(instDir, "dev"))
 	overrideCmdline(instDir, "talos.platform=metal "+strings.Join(extra, " "))
 
