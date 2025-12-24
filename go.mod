@@ -4,7 +4,9 @@ go 1.24.0
 
 require (
 	github.com/google/go-containerregistry v0.20.6
+	github.com/google/uuid v1.6.0
 	golang.org/x/sys v0.34.0
+	golang.org/x/text v0.32.0
 )
 
 require (
@@ -19,5 +21,5 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/vbatts/tar-split v0.12.1 // indirect
-	golang.org/x/sync v0.15.0 // indirect
+	golang.org/x/sync v0.19.0 // indirect
 )
