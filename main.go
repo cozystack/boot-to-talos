@@ -318,7 +318,7 @@ func collectKernelArgs() []string {
 
 func main() {
 	var extra multiFlag
-	sizeGiB := flag.Uint64("image-size-gib", 2, "image.raw size (GiB)")
+	sizeGiB := flag.Uint64("image-size-gib", 3, "image.raw size (GiB)")
 	flag.Var(&extra, "extra-kernel-arg", "extra kernel arg (repeatable)")
 	flag.Parse()
 
