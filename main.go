@@ -286,10 +286,11 @@ func hexIPLittle(h string) string {
 	return fmt.Sprintf("%d.%d.%d.%d", b[3], b[2], b[1], b[0])
 }
 
+var re = regexp.MustCompile(`^([a-z0-9]+)\.(\d+)$`)
+
 func getVID(name string) (int, string, error) {
-	re := regexp.MustCompile(`^([a-z0-9]+)\.(\d+)$`)
 	matches := re.FindStringSubmatch(name)
-	phy := ""
+	phy := name
 	if len(matches) == 3 {
 		vid, err := strconv.Atoi(matches[2])
 		phy = matches[1]
@@ -297,8 +298,6 @@ func getVID(name string) (int, string, error) {
 			return 0, phy, fmt.Errorf("invalid VID: %s", matches[2])
 		}
 		return vid, phy, nil
-	} else {
-		phy = name
 	}
 	return 0, phy, nil
 }
@@ -325,7 +324,10 @@ func collectKernelArgsSimple() []string {
 	var out []string
 	if netOn {
 		dev = ask("Interface", dev)
-		vid, phy, _ := getVID(dev)
+		vid, phy, err := getVID(dev)
+		if err != nil {
+			log.Fatalf("%s", err)
+		}
 		ip = ask("IP address", ip)
 		mask = ask("Netmask", mask)
 		gw = ask("Gateway (or 'none')", gw)
