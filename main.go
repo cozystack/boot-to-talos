@@ -286,16 +286,19 @@ func hexIPLittle(h string) string {
 	return fmt.Sprintf("%d.%d.%d.%d", b[3], b[2], b[1], b[0])
 }
 
-var re = regexp.MustCompile(`^([a-z0-9]+)\.(\d+)$`)
+var vlanInterfaceRegex = regexp.MustCompile(`^([a-z0-9]+)\.(\d+)$`)
 
 func getVID(name string) (int, string, error) {
-	matches := re.FindStringSubmatch(name)
+	matches := vlanInterfaceRegex.FindStringSubmatch(name)
 	phy := name
 	if len(matches) == 3 {
 		vid, err := strconv.Atoi(matches[2])
 		phy = matches[1]
-		if err != nil || vid < 1 || vid > 4094 {
-			return 0, phy, fmt.Errorf("invalid VID: %s", matches[2])
+		if err != nil {
+			return 0, phy, fmt.Errorf("invalid VID in interface name: %q is not a valid integer", matches[2])
+		}
+		if vid < 1 || vid > 4094 {
+			return 0, phy, fmt.Errorf("invalid VID in interface name: %d is out of the valid range (1-4094)", vid)
 		}
 		return vid, phy, nil
 	}
