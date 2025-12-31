@@ -35,6 +35,7 @@ var (
 	diskFlag  string
 	yesFlag   bool
 	modeFlag  string
+	devFlag   string
 )
 
 func init() {
@@ -44,6 +45,7 @@ func init() {
 	flag.BoolVar(&yesFlag, "yes", false, "automatic yes to prompts")
 	flag.StringVar(&modeFlag, "mode", "", "mode: boot or install")
 	flag.StringVar(&modeFlag, "m", "", "mode: boot or install (shorthand)")
+	flag.StringVar(&devFlag, "override-interface", "", "override network interface name")
 }
 
 /* ------------------------------ helpers ----------------------------------- */
@@ -322,6 +324,9 @@ func collectKernelArgsSimple() []string {
 	ip, mask, _ := ifaceAddr(dev)
 	dev = prettyName(dev)
 	hostname := getHostnameSimple()
+	if devFlag != "" {
+		dev = devFlag
+	}
 
 	netOn := askYesNo("Add networking configuration?", true)
 	var out []string
