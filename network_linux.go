@@ -60,6 +60,7 @@ type LinkInfo struct {
 	Name             string
 	Index            uint32
 	Type             uint16
+	LinkIndex        uint32 // Parent interface index (for VLAN, etc.)
 	Flags            uint32
 	HardwareAddr     net.HardwareAddr
 	MTU              uint32
@@ -68,6 +69,13 @@ type LinkInfo struct {
 	Kind             string
 	SlaveKind        string
 	BondMaster       *BondMasterSpec
+	VLAN             *VLANSpec
+}
+
+// VLANSpec represents VLAN configuration
+type VLANSpec struct {
+	VID      uint16 // VLAN ID (1-4094)
+	Protocol uint16 // VLAN protocol (0x8100 for 802.1Q, 0x88a8 for 802.1ad)
 }
 
 // BondMasterSpec represents bond master configuration
@@ -111,6 +119,11 @@ func (l *LinkInfo) IsBridgeSlave() bool {
 	return l.SlaveKind == "bridge"
 }
 
+// IsVLAN returns true if the link is a VLAN interface
+func (l *LinkInfo) IsVLAN() bool {
+	return l.Kind == "vlan"
+}
+
 // IsPhysical returns true if the link is a physical ethernet interface
 func (l *LinkInfo) IsPhysical() bool {
 	return l.Kind == "" && l.Type == 1 && !l.IsBondSlave() && !l.IsBridgeSlave()
@@ -150,6 +163,28 @@ func (n *NetworkInfo) GetBridgePorts(masterIndex uint32) []*LinkInfo {
 	return ports
 }
 
+// GetVLANChain returns all VLAN interfaces in the path from link to physical/bond
+// Returns VLANs in order from topmost to lowest (closest to physical)
+func (n *NetworkInfo) GetVLANChain(link *LinkInfo) []*LinkInfo {
+	var vlans []*LinkInfo
+	current := link
+
+	for current != nil {
+		if current.IsVLAN() {
+			vlans = append(vlans, current)
+			if current.LinkIndex > 0 {
+				current = n.GetLinkByIndex(current.LinkIndex)
+			} else {
+				break
+			}
+		} else {
+			break
+		}
+	}
+
+	return vlans
+}
+
 // collectNetworkInfo gathers all network interface information via netlink
 func collectNetworkInfo() (*NetworkInfo, error) {
 	conn, err := rtnetlink.Dial(nil)
@@ -179,6 +214,11 @@ func collectNetworkInfo() (*NetworkInfo, error) {
 			OperationalState: link.Attributes.OperationalState,
 		}
 
+		// Get parent interface index (used by VLAN and other stacked interfaces)
+		if link.Attributes.Type != 0 {
+			li.LinkIndex = link.Attributes.Type
+		}
+
 		if link.Attributes.Master != nil {
 			li.MasterIndex = *link.Attributes.Master
 		}
@@ -187,13 +227,23 @@ func collectNetworkInfo() (*NetworkInfo, error) {
 			li.Kind = link.Attributes.Info.Kind
 			li.SlaveKind = link.Attributes.Info.SlaveKind
 
-			if li.Kind == "bond" && link.Attributes.Info.Data != nil {
+			if link.Attributes.Info.Data != nil {
 				if linkData, ok := link.Attributes.Info.Data.(*rtnetlink.LinkData); ok {
-					bondSpec, err := decodeBondMasterSpec(linkData.Data)
-					if err != nil {
-						log.Printf("warning: failed to decode bond master spec for %s: %v", link.Attributes.Name, err)
-					} else {
-						li.BondMaster = bondSpec
+					switch li.Kind {
+					case "bond":
+						bondSpec, err := decodeBondMasterSpec(linkData.Data)
+						if err != nil {
+							log.Printf("warning: failed to decode bond master spec for %s: %v", link.Attributes.Name, err)
+						} else {
+							li.BondMaster = bondSpec
+						}
+					case "vlan":
+						vlanSpec, err := decodeVLANSpec(linkData.Data)
+						if err != nil {
+							log.Printf("warning: failed to decode VLAN spec for %s: %v", link.Attributes.Name, err)
+						} else {
+							li.VLAN = vlanSpec
+						}
 					}
 				}
 			}
@@ -256,12 +306,44 @@ func decodeBondMasterSpec(data []byte) (*BondMasterSpec, error) {
 	return spec, decoder.Err()
 }
 
+func decodeVLANSpec(data []byte) (*VLANSpec, error) {
+	spec := &VLANSpec{}
+	decoder, err := netlink.NewAttributeDecoder(data)
+	if err != nil {
+		return nil, err
+	}
+
+	for decoder.Next() {
+		switch decoder.Type() {
+		case unix.IFLA_VLAN_ID:
+			spec.VID = decoder.Uint16()
+		case unix.IFLA_VLAN_PROTOCOL:
+			// Protocol is stored in network byte order (big-endian)
+			b := decoder.Bytes()
+			if len(b) >= 2 {
+				spec.Protocol = uint16(b[0])<<8 | uint16(b[1])
+			}
+		}
+	}
+
+	return spec, decoder.Err()
+}
+
 // resolveNetworkDevice finds the actual device to use for network configuration
 // If the device is a bridge, it finds the underlying physical interface or bond
 // If the device is a bond, it returns the bond itself
+// If the device is a VLAN, it recursively resolves the parent interface
 func resolveNetworkDevice(info *NetworkInfo, link *LinkInfo) *LinkInfo {
 	if link == nil {
 		return nil
+	}
+
+	// If it's a VLAN, recursively resolve the parent interface
+	if link.IsVLAN() && link.LinkIndex > 0 {
+		parent := info.GetLinkByIndex(link.LinkIndex)
+		if parent != nil {
+			return resolveNetworkDevice(info, parent)
+		}
 	}
 
 	// If it's a bridge, find the underlying device
@@ -271,6 +353,13 @@ func resolveNetworkDevice(info *NetworkInfo, link *LinkInfo) *LinkInfo {
 			// Prefer bond over physical interface
 			if port.IsBond() {
 				return port
+			}
+			// Also check for VLAN on bond
+			if port.IsVLAN() {
+				resolved := resolveNetworkDevice(info, port)
+				if resolved != nil && resolved.IsBond() {
+					return resolved
+				}
 			}
 		}
 		// Fall back to first port that is physical or bond
@@ -417,6 +506,24 @@ func generateBondCmdline(info *NetworkInfo, bond *LinkInfo, bondName string) str
 		strings.Join(options, ","))
 }
 
+// generateVLANCmdline generates kernel cmdline for VLAN configuration
+// Format: vlan=<vlandev>:<parent>
+// Example: vlan=eth0.100:eth0
+func generateVLANCmdline(info *NetworkInfo, vlan *LinkInfo, vlanName string) string {
+	if vlan == nil || !vlan.IsVLAN() || vlan.VLAN == nil {
+		return ""
+	}
+
+	// Get parent interface
+	parent := info.GetLinkByIndex(vlan.LinkIndex)
+	if parent == nil {
+		return ""
+	}
+
+	parentName := prettyName(parent.Name)
+	return fmt.Sprintf("vlan=%s:%s", vlanName, parentName)
+}
+
 // generateIPCmdline generates kernel cmdline for IP configuration
 // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
 // Example: ip=10.200.16.12::10.200.16.1:255.255.240.0:hostname:bond0:none
@@ -426,7 +533,7 @@ func generateIPCmdline(ip, gateway, netmask, hostname, device string) string {
 	return fmt.Sprintf("ip=%s::%s:%s:%s:%s:none", ip, gateway, netmask, hostname, device)
 }
 
-// collectKernelArgsNetlink collects kernel arguments using netlink for better bond/bridge detection
+// collectKernelArgsNetlink collects kernel arguments using netlink for better bond/bridge/vlan detection
 func collectKernelArgsNetlink() []string {
 	// Try to collect network info via netlink
 	netInfo, err := collectNetworkInfo()
@@ -450,7 +557,10 @@ func collectKernelArgsNetlink() []string {
 		return nil
 	}
 
-	// Resolve to actual device (handle bridge -> bond/physical)
+	// Get VLAN chain if any (from topmost to lowest)
+	vlans := netInfo.GetVLANChain(link)
+
+	// Resolve to actual device (handle bridge/vlan -> bond/physical)
 	actualDevice := resolveNetworkDevice(netInfo, link)
 	if actualDevice == nil {
 		actualDevice = link
@@ -471,7 +581,13 @@ func collectKernelArgsNetlink() []string {
 
 	var out []string
 
-	// Determine if we're dealing with a bond
+	// Determine the final device name for IP configuration
+	// If there's a VLAN, the IP goes on the VLAN interface
+	// If there's a bond, the IP goes on the bond (or VLAN on bond)
+	var ipDevice string
+	bondName := "bond0"
+
+	// Handle bond
 	if actualDevice.IsBond() {
 		fmt.Printf("\nDetected bond interface: %s\n", actualDevice.Name)
 		slaves := netInfo.GetBondSlaves(actualDevice.Index)
@@ -492,47 +608,86 @@ func collectKernelArgsNetlink() []string {
 				fmt.Printf("  LACP rate: %s\n", lacpRateToString(actualDevice.BondMaster.LACPRate))
 			}
 		}
-		fmt.Println()
-
-		// For Talos, we use standard bond0 name
-		bondName := "bond0"
 
 		// Generate bond cmdline
 		bondCmdline := generateBondCmdline(netInfo, actualDevice, bondName)
 		if bondCmdline != "" {
 			out = append(out, bondCmdline)
 		}
-
-		// Ask for IP configuration
-		ip = ask("IP address", ip)
-		mask = ask("Netmask", mask)
-		gw = ask("Gateway (or 'none')", gw)
-		if strings.EqualFold(gw, "none") {
-			gw = ""
-		}
-		hostname := ask("Hostname", getHostname())
-
-		// Generate IP cmdline with bond0 as device
-		ipCmdline := generateIPCmdline(ip, gw, mask, hostname, bondName)
-		out = append(out, ipCmdline)
+		ipDevice = bondName
 	} else {
 		// Regular interface
-		devPretty := prettyName(actualDevice.Name)
-		fmt.Printf("\nDetected interface: %s (%s)\n\n", actualDevice.Name, devPretty)
-
-		devPretty = ask("Interface", devPretty)
-		ip = ask("IP address", ip)
-		mask = ask("Netmask", mask)
-		gw = ask("Gateway (or 'none')", gw)
-		if strings.EqualFold(gw, "none") {
-			gw = ""
-		}
-		hostname := ask("Hostname", getHostname())
-
-		// Standard ip= format with hostname
-		ipCmdline := generateIPCmdline(ip, gw, mask, hostname, devPretty)
-		out = append(out, ipCmdline)
+		ipDevice = prettyName(actualDevice.Name)
+		fmt.Printf("\nDetected interface: %s (%s)\n", actualDevice.Name, ipDevice)
 	}
+
+	// Handle VLANs
+	if len(vlans) > 0 {
+		fmt.Printf("\nDetected VLAN configuration:\n")
+		for _, vlan := range vlans {
+			if vlan.VLAN != nil {
+				parent := netInfo.GetLinkByIndex(vlan.LinkIndex)
+				parentName := "unknown"
+				if parent != nil {
+					if parent.IsBond() && actualDevice.IsBond() {
+						parentName = bondName
+					} else {
+						parentName = prettyName(parent.Name)
+					}
+				}
+				fmt.Printf("  VLAN %d on %s (interface: %s)\n", vlan.VLAN.VID, parentName, vlan.Name)
+			}
+		}
+		fmt.Println()
+
+		// Generate VLAN cmdlines (in reverse order - from lowest to topmost)
+		// This ensures parent interfaces are created before child VLANs
+		for i := len(vlans) - 1; i >= 0; i-- {
+			vlan := vlans[i]
+			if vlan.VLAN == nil {
+				continue
+			}
+
+			// Determine VLAN device name for Talos
+			// Format: <parent>.<vid>
+			parent := netInfo.GetLinkByIndex(vlan.LinkIndex)
+			var parentName string
+			if parent != nil {
+				if parent.IsBond() && actualDevice.IsBond() {
+					parentName = bondName
+				} else if parent.IsVLAN() {
+					// Nested VLAN - find the previous VLAN's name
+					// For now, use predictable name
+					parentName = prettyName(parent.Name)
+				} else {
+					parentName = prettyName(parent.Name)
+				}
+			}
+
+			vlanName := fmt.Sprintf("%s.%d", parentName, vlan.VLAN.VID)
+			vlanCmdline := fmt.Sprintf("vlan=%s:%s", vlanName, parentName)
+			out = append(out, vlanCmdline)
+
+			// The topmost VLAN is where we put the IP
+			if i == 0 {
+				ipDevice = vlanName
+			}
+		}
+	}
+
+	// Ask for IP configuration
+	ipDevice = ask("Network device for IP", ipDevice)
+	ip = ask("IP address", ip)
+	mask = ask("Netmask", mask)
+	gw = ask("Gateway (or 'none')", gw)
+	if strings.EqualFold(gw, "none") {
+		gw = ""
+	}
+	hostname := ask("Hostname", getHostname())
+
+	// Generate IP cmdline
+	ipCmdline := generateIPCmdline(ip, gw, mask, hostname, ipDevice)
+	out = append(out, ipCmdline)
 
 	// Serial console
 	console := ask("Configure serial console? (or 'no')", "ttyS0")
