@@ -287,9 +287,20 @@ func hexIPLittle(h string) string {
 /* ---------------- collect kernel arguments -------------------------------- */
 
 func collectKernelArgs() []string {
+	// Try netlink-based detection first (supports bond/bridge)
+	if args := collectKernelArgsNetlink(); args != nil {
+		return args
+	}
+
+	// Fallback to simple detection
+	return collectKernelArgsSimple()
+}
+
+func collectKernelArgsSimple() []string {
 	dev, gw, _ := defaultRoute()
 	ip, mask, _ := ifaceAddr(dev)
 	dev = prettyName(dev)
+	hostname := getHostnameSimple()
 
 	netOn := askYesNo("Add networking configuration?", true)
 	var out []string
@@ -301,7 +312,8 @@ func collectKernelArgs() []string {
 		if strings.EqualFold(gw, "none") {
 			gw = ""
 		}
-		out = append(out, fmt.Sprintf("ip=%s::%s:%s::%s:::::", ip, gw, mask, dev))
+		hostname = ask("Hostname", hostname)
+		out = append(out, fmt.Sprintf("ip=%s::%s:%s:%s:%s:none", ip, gw, mask, hostname, dev))
 	}
 
 	console := ask("Configure serial console? (or 'no')", "ttyS0")
@@ -312,6 +324,18 @@ func collectKernelArgs() []string {
 		out = append(out, "console="+console)
 	}
 	return out
+}
+
+func getHostnameSimple() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	// Remove domain part if present
+	if idx := strings.IndexByte(hostname, '.'); idx > 0 {
+		hostname = hostname[:idx]
+	}
+	return hostname
 }
 
 /* ------------------------------ main -------------------------------------- */
