@@ -15,8 +15,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"unsafe"
 
@@ -288,25 +286,6 @@ func hexIPLittle(h string) string {
 	return fmt.Sprintf("%d.%d.%d.%d", b[3], b[2], b[1], b[0])
 }
 
-var vlanInterfaceRegex = regexp.MustCompile(`^([a-z0-9]+)\.(\d+)$`)
-
-func getVID(name string) (int, string, error) {
-	matches := vlanInterfaceRegex.FindStringSubmatch(name)
-	phy := name
-	if len(matches) == 3 {
-		vid, err := strconv.Atoi(matches[2])
-		phy = matches[1]
-		if err != nil {
-			return 0, phy, fmt.Errorf("invalid VID in interface name: %q is not a valid integer", matches[2])
-		}
-		if vid < 1 || vid > 4094 {
-			return 0, phy, fmt.Errorf("invalid VID in interface name: %d is out of the valid range (1-4094)", vid)
-		}
-		return vid, phy, nil
-	}
-	return 0, phy, nil
-}
-
 /* ---------------- collect kernel arguments -------------------------------- */
 
 func collectKernelArgs() []string {
@@ -332,10 +311,6 @@ func collectKernelArgsSimple() []string {
 	var out []string
 	if netOn {
 		dev = ask("Interface", dev)
-		vid, phy, err := getVID(dev)
-		if err != nil {
-			log.Fatalf("%s", err)
-		}
 		ip = ask("IP address", ip)
 		mask = ask("Netmask", mask)
 		gw = ask("Gateway (or 'none')", gw)
