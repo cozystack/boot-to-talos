@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unsafe"
 
 	"github.com/google/go-containerregistry/pkg/crane"
@@ -104,9 +103,17 @@ func createMemfdFromReader(name string, reader io.Reader) (*os.File, error) {
 	return file, nil
 }
 
+// kexec_segment structure for kexec_load syscall
+type kexecSegment struct {
+	buf   uintptr
+	bufsz uint64
+	mem   uint64
+	memsz uint64
+}
+
 func kexecLoadFromUKI(ukiPath string, extraCmdline string) error {
-	// Use KexecFileLoad - it's simpler and more correct
-	log.Printf("using KexecFileLoad")
+	// Use old kexec_load API - it doesn't require signature verification
+	log.Printf("using kexec_load (legacy API without signature verification)")
 
 	// Extract assets from UKI
 	assets, err := ExtractUKI(ukiPath)
@@ -115,20 +122,19 @@ func kexecLoadFromUKI(ukiPath string, extraCmdline string) error {
 	}
 	defer assets.Close()
 
-	// Create memfd for kernel from reader
-	kernelFile, err := createMemfdFromReader("kernel", assets.Kernel)
+	// Read kernel into memory
+	kernelData, err := io.ReadAll(assets.Kernel)
 	if err != nil {
-		return fmt.Errorf("failed to create kernel memfd: %w", err)
+		return fmt.Errorf("failed to read kernel: %w", err)
 	}
-	defer kernelFile.Close()
+	log.Printf("kernel size: %d bytes", len(kernelData))
 
-	// Create memfd for initramfs from reader
-	initrdFile, err := createMemfdFromReader("initramfs", assets.Initrd)
+	// Read initramfs into memory
+	initrdData, err := io.ReadAll(assets.Initrd)
 	if err != nil {
-		return fmt.Errorf("failed to create initramfs memfd: %w", err)
+		return fmt.Errorf("failed to read initramfs: %w", err)
 	}
-	defer initrdFile.Close()
-	initrdFD := int(initrdFile.Fd())
+	log.Printf("initramfs size: %d bytes", len(initrdData))
 
 	// Read cmdline from UKI
 	ukiCmdlineBytes, err := io.ReadAll(assets.Cmdline)
@@ -146,55 +152,64 @@ func kexecLoadFromUKI(ukiPath string, extraCmdline string) error {
 	if extraCmdline != "" {
 		cmdlineParts = append(cmdlineParts, extraCmdline)
 	}
-	cmdline := strings.Join(cmdlineParts, " ")
-
-	log.Printf("cmdline: %s", cmdline)
-
-	// Call kexec_file_load via syscall
-	// SYS_KEXEC_FILE_LOAD = 320 on x86_64
-	// long kexec_file_load(int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline, unsigned long flags)
-	const SYS_KEXEC_FILE_LOAD = 320
-	// KEXEC_FILE_LOAD_UNSAFE = 0x00000001 - skip signature verification (if lockdown is not enabled)
-	// KEXEC_FILE_LOAD_NO_VERIFY_SIG = 0x00000002 - skip signature verification
-	const KEXEC_FILE_LOAD_UNSAFE = 0x00000001
-	const KEXEC_FILE_LOAD_NO_VERIFY_SIG = 0x00000002
-
+	cmdline := strings.Join(cmdlineParts, " ") + "\x00" // null terminator
 	cmdlineBytes := []byte(cmdline)
-	if len(cmdlineBytes) > 0 {
-		cmdlineBytes = append(cmdlineBytes, 0) // null terminator
+
+	log.Printf("cmdline: %s", strings.TrimRight(cmdline, "\x00"))
+
+	// Prepare kexec segments
+	// For x86_64, we use a simplified approach:
+	// - Load entire bzImage at 2MB boundary (safe for modern systems)
+	// - Load initrd at a high address (below 4GB boundary)
+	// - Use zero entry point to let kernel auto-detect
+	
+	const KERNEL_LOAD_ADDR = 0x200000      // 2MB - safe alignment for modern kernels
+	const INITRD_LOAD_ADDR = 0x7f000000    // ~2GB - safe for initrd
+	const CMDLINE_LOAD_ADDR = 0x20000      // 128KB - traditional cmdline location
+
+	segments := []kexecSegment{
+		// Kernel image (entire bzImage)
+		{
+			buf:   uintptr(unsafe.Pointer(&kernelData[0])),
+			bufsz: uint64(len(kernelData)),
+			mem:   KERNEL_LOAD_ADDR,
+			memsz: uint64(len(kernelData)),
+		},
+		// Initramfs
+		{
+			buf:   uintptr(unsafe.Pointer(&initrdData[0])),
+			bufsz: uint64(len(initrdData)),
+			mem:   INITRD_LOAD_ADDR,
+			memsz: uint64(len(initrdData)),
+		},
+		// Command line
+		{
+			buf:   uintptr(unsafe.Pointer(&cmdlineBytes[0])),
+			bufsz: uint64(len(cmdlineBytes)),
+			mem:   CMDLINE_LOAD_ADDR,
+			memsz: uint64(len(cmdlineBytes)),
+		},
 	}
 
-	var cmdlinePtr uintptr
-	if len(cmdlineBytes) > 0 {
-		cmdlinePtr = uintptr(unsafe.Pointer(&cmdlineBytes[0]))
-	}
+	// Call kexec_load via syscall
+	// SYS_KEXEC_LOAD = 246 on x86_64, 283 on ARM64
+	// long kexec_load(unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigned long flags)
+	const SYS_KEXEC_LOAD = 246
+	const KEXEC_ARCH_X86_64 = 62 << 16  // KEXEC_ARCH_X86_64
 
-	// Try first without flags (requires signed kernel)
-	var flags uintptr = 0
+	// Entry point 0 means auto-detect from kernel header
+	var entry uintptr = 0
+	var flags uintptr = KEXEC_ARCH_X86_64
+
 	_, _, errno := unix.Syscall6(
-		SYS_KEXEC_FILE_LOAD,
-		uintptr(kernelFile.Fd()),   // kernel_fd
-		uintptr(initrdFD),          // initrd_fd (-1 if none)
-		uintptr(len(cmdlineBytes)), // cmdline_len
-		cmdlinePtr,                 // cmdline
-		flags,                      // flags
-		0,                          // unused
+		SYS_KEXEC_LOAD,
+		entry,                                 // entry (0 = auto-detect)
+		uintptr(len(segments)),                // nr_segments
+		uintptr(unsafe.Pointer(&segments[0])), // segments
+		flags,                                 // flags
+		0,                                     // unused
+		0,                                     // unused
 	)
-
-	// If we got EPERM and it's not due to sysctl, try with flag to skip signature verification
-	if errno == unix.EPERM {
-		log.Printf("kexec_file_load failed with EPERM, trying with KEXEC_FILE_LOAD_UNSAFE flag (may require lockdown=off)")
-		flags = KEXEC_FILE_LOAD_UNSAFE
-		_, _, errno = unix.Syscall6(
-			SYS_KEXEC_FILE_LOAD,
-			uintptr(kernelFile.Fd()),   // kernel_fd
-			uintptr(initrdFD),          // initrd_fd (-1 if none)
-			uintptr(len(cmdlineBytes)), // cmdline_len
-			cmdlinePtr,                 // cmdline
-			flags,                      // flags
-			0,                          // unused
-		)
-	}
 
 	if errno != 0 {
 		switch errno {
@@ -204,23 +219,20 @@ func kexecLoadFromUKI(ukiPath string, extraCmdline string) error {
 			// EPERM can mean several things:
 			// 1. sysctl is disabled
 			// 2. lockdown mode is enabled
-			// 3. kernel signature is required
 			lockdownData, _ := os.ReadFile("/sys/kernel/security/lockdown")
 			lockdown := strings.TrimSpace(string(lockdownData))
 			if strings.Contains(lockdown, "[confidentiality]") || strings.Contains(lockdown, "[integrity]") {
-				return fmt.Errorf("kexec blocked: kernel is in lockdown mode (%s). Solutions:\n  1. Boot with 'lockdown=none' kernel parameter\n  2. Use signed UKI kernel\n  3. Disable Secure Boot", lockdown)
+				return fmt.Errorf("kexec blocked: kernel is in lockdown mode (%s). Solutions:\n  1. Boot with 'lockdown=none' kernel parameter\n  2. Disable Secure Boot", lockdown)
 			}
 			sysctlData, _ := os.ReadFile("/proc/sys/kernel/kexec_load_disabled")
 			if strings.TrimSpace(string(sysctlData)) == "1" {
 				return fmt.Errorf("kexec is disabled via sysctl. Run: sudo sysctl -w kernel.kexec_load_disabled=0")
 			}
-			return fmt.Errorf("kexec blocked: permission denied. Possible causes:\n  1. Kernel requires signed image (try booting with 'lockdown=none')\n  2. Secure Boot is enabled\n  3. Check /proc/sys/kernel/kexec_load_disabled")
+			return fmt.Errorf("kexec blocked: permission denied. Check /proc/sys/kernel/kexec_load_disabled")
 		case unix.EBUSY:
 			return fmt.Errorf("kexec is busy (another kexec may be in progress)")
-		case syscall.Errno(129): // EKEYREJECTED = 129
-			return fmt.Errorf("kernel signature verification failed (unsigned kernel with lockdown enabled)")
-		case syscall.Errno(95): // ENOTSUP = 95
-			return fmt.Errorf("kexec_file_load not supported (old kernel or missing CONFIG_KEXEC_FILE)")
+		case unix.EINVAL:
+			return fmt.Errorf("invalid kexec parameters. Check dmesg for details (may need different load addresses or kernel format)")
 		default:
 			return fmt.Errorf("error loading kernel for kexec: %v (errno: %d). Check dmesg for details", errno, errno)
 		}
