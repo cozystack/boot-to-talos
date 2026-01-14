@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -159,7 +160,8 @@ func askYesNo(msg string, def bool) bool {
 func askMode() string {
 	modeOptions := "Mode:\n" +
 		"  1. boot – extract the kernel and initrd from the Talos installer and boot them directly using the kexec mechanism.\n" +
-		"  2. install – prepare the environment, run the Talos installer, and then overwrite the system disk with the installed image."
+		"  2. install – prepare the environment, run the Talos installer, and then overwrite the system disk with the installed image.\n" +
+		"  3. initramfs – use current kernel with Talos initramfs (modified to include current kernel modules)."
 
 	if yesFlag {
 		fmt.Println(modeOptions)
@@ -177,7 +179,10 @@ func askMode() string {
 		if in == "2" || in == "install" {
 			return "install"
 		}
-		fmt.Println("Please enter '1' or '2' (or 'boot'/'install').")
+		if in == "3" || in == "initramfs" {
+			return "initramfs"
+		}
+		fmt.Println("Please enter '1', '2', or '3' (or 'boot'/'install'/'initramfs').")
 	}
 }
 
@@ -341,6 +346,28 @@ func getHostnameSimple() string {
 /* ------------------------------ main -------------------------------------- */
 
 func main() {
+	// Check if we're running as init in initramfs ($0 == "init" or path contains "/init")
+	if len(os.Args) > 0 {
+		progName := filepath.Base(os.Args[0])
+		if progName == "init" || os.Args[0] == "/init" || strings.HasSuffix(os.Args[0], "/init") {
+			// We're running as init in initramfs
+			// Load br_netfilter module using syscall
+			log.Print("loading br_netfilter module")
+			if err := loadKernelModule("br_netfilter"); err != nil {
+				log.Printf("warning: failed to load br_netfilter: %v (continuing anyway)", err)
+			}
+			
+			// Exec Talos init
+			log.Print("executing Talos init")
+			talosInit := "/init.talos"
+			if err := syscall.Exec(talosInit, []string{talosInit}, os.Environ()); err != nil {
+				log.Fatalf("failed to exec %s: %v", talosInit, err)
+			}
+			// Should not reach here
+			return
+		}
+	}
+
 	var extra multiFlag
 	sizeGiB := flag.Uint64("image-size-gib", 3, "image.raw size (GiB)")
 	flag.Var(&extra, "extra-kernel-arg", "extra kernel arg (repeatable)")
@@ -351,8 +378,8 @@ func main() {
 		modeFlag = askMode()
 	} else {
 		// Check validity of specified mode
-		if modeFlag != "boot" && modeFlag != "install" {
-			log.Fatalf("invalid mode: %s (must be 'boot' or 'install')", modeFlag)
+		if modeFlag != "boot" && modeFlag != "install" && modeFlag != "initramfs" {
+			log.Fatalf("invalid mode: %s (must be 'boot', 'install', or 'initramfs')", modeFlag)
 		}
 	}
 
@@ -370,14 +397,19 @@ func main() {
 		}
 	}
 
-	// Collect kernel args for both modes
+	// Collect kernel args for all modes
 	for _, e := range collectKernelArgs() {
 		extra = append(extra, e)
 	}
 
-	// If not installation mode, use boot
+	// Route to appropriate mode handler
 	if modeFlag == "boot" {
 		runBootMode(imageFlag, extra)
+		return
+	}
+
+	if modeFlag == "initramfs" {
+		runInitramfsMode(extra)
 		return
 	}
 
