@@ -2,6 +2,78 @@
 
 Convert any OS to Talos Linux — completely from userspace, no external dependencies except the Talos installer image.
 
+## Supported Image Sources
+
+boot-to-talos supports multiple image sources:
+
+| Source Type | Example | Description |
+|-------------|---------|-------------|
+| Container | `ghcr.io/cozystack/cozystack/talos:v1.11` | Container registry images (default) |
+| ISO | `talos-v1.11.0-metal-amd64.iso` | Local ISO files |
+| RAW | `talos-v1.11.0-metal-amd64.raw.xz` | Local RAW disk images (supports .xz and .gz compression) |
+| HTTP | `https://factory.talos.dev/image/.../metal-amd64.raw.xz` | Remote ISO or RAW images |
+
+The image type is auto-detected from the file extension or URL path.
+
+### Supported Combinations
+
+Not all source types support all operation modes:
+
+| Source | boot mode | install mode |
+| --- | --- | --- |
+| Container | ✓ | ✓ |
+| RAW | ✓ | ✓ |
+| ISO | ✓ | ✗ |
+| HTTP (RAW/ISO) | ✓ | ✓* |
+
+**Note:** HTTP source delegates to RAW or ISO source after download. *Install mode via HTTP only works with RAW images.
+
+### Factory Images
+
+You can use official Talos factory images from [factory.talos.dev](https://factory.talos.dev):
+
+```console
+# Install from factory RAW image (recommended for install mode)
+boot-to-talos -yes -disk /dev/sda -image https://factory.talos.dev/image/SCHEMATIC_ID/v1.11.0/metal-amd64.raw.xz
+
+# Install from local RAW image
+boot-to-talos -yes -disk /dev/sda -image ./talos-v1.11.0-metal-amd64.raw.xz
+
+# Boot from local ISO
+boot-to-talos -yes -mode boot -image ./talos-v1.11.0-metal-amd64.iso
+```
+
+### Secure Boot Compatibility
+
+| Mode | Container | ISO | RAW |
+| --- | --- | --- | --- |
+| install | Requires SB disabled* | Requires SB disabled* | Requires SB disabled* |
+| boot (kexec) | No** | No** | No** |
+
+#### Why Secure Boot must be disabled
+
+Talos Linux UKI (Unified Kernel Image) is signed with Sidero Labs keys. Your system's UEFI firmware only trusts keys from its signature database (db), which typically contains Microsoft and OEM keys — not Sidero Labs keys.
+
+**This cannot be bypassed programmatically** because:
+
+- Adding keys to UEFI db requires signing with existing KEK (we don't have Microsoft's private key)
+- MOK (Machine Owner Key) enrollment requires physical presence at boot (MokManager UI)
+- Disabling Secure Boot requires BIOS/UEFI access
+
+#### For remote servers without iKVM/BMC console
+
+You must disable Secure Boot **before** using boot-to-talos:
+
+- Via IPMI/BMC web interface (if available)
+- Via Redfish API (if supported by your server)
+- Physically during initial server setup
+
+boot-to-talos will detect Secure Boot state and warn you if it's enabled.
+
+#### Boot mode limitations
+
+\** Boot mode uses kexec syscall which is blocked when kernel lockdown is active. Lockdown mode is automatically enabled when Secure Boot is on. There is no workaround — boot mode requires Secure Boot to be disabled.
+
 ## How it works
 
 1. **Unpack in RAM** – layers from the Talos‑installer container are extracted into a throw‑away `tmpfs`; no Docker needed.
@@ -93,9 +165,10 @@ boot-to-talos -yes -disk /dev/sda -image ghcr.io/cozystack/cozystack/talos:v1.10
 | Flag                  | Description                                                        | Example                                         |
 |-----------------------|--------------------------------------------------------------------|-------------------------------------------------|
 | `-yes`                | Run non-interactively, do not ask for confirmation                 | `-yes`                                          |
-| `-disk string`        | Target disk (will be wiped)                                        | `-disk /dev/sda`                                |
-| `-image string`       | Talos installer image (default: `ghcr.io/cozystack/cozystack/talos:v1.10.5`) | `-image ghcr.io/cozystack/cozystack/talos:v1.10.5` |
-| `-image-size-gib uint`| Size of image.raw in GiB (default: 2)                              | `-image-size-gib 4`                             |
+| `-mode string`        | Operation mode: `boot` or `install` (default: interactive)         | `-mode install`                                 |
+| `-disk string`        | Target disk (will be wiped, install mode only)                     | `-disk /dev/sda`                                |
+| `-image string`       | Talos image (container ref, ISO path, RAW path, or HTTP URL)       | `-image ghcr.io/cozystack/cozystack/talos:v1.11` |
+| `-image-size-gib uint`| Size of image.raw in GiB (default: 3)                              | `-image-size-gib 4`                             |
 | `-extra-kernel-arg value` | Extra kernel argument (can be repeated)                        | `-extra-kernel-arg "console=ttyS0"`             |
 
 **Tip:** All flags can be combined. If a flag is not provided, the installer will prompt for input (unless `-yes` is used).
