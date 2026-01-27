@@ -1,12 +1,10 @@
 //go:build linux
-// +build linux
 
-package main
+package efi
 
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -17,22 +15,82 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/cockroachdb/errors"
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 	"golang.org/x/text/encoding/unicode"
 )
 
-/* -------------------- EFI variables update helpers ------------------------------- */
+const (
+	efiVarsMountPoint = "/sys/firmware/efi/efivars"
+	efiVarsPath       = "/sys/firmware/efi/efivars"
+)
 
-// isUEFIBoot returns true if the system is booted using UEFI.
-func isUEFIBoot() bool {
+//nolint:gochecknoglobals
+var scopeGlobal = uuid.MustParse("8be4df61-93ca-11d2-aa0d-00e098032b8c")
+
+//nolint:gochecknoglobals
+var efiEncoding = unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM)
+
+type efiAttribute uint32
+
+const (
+	attrNonVolatile efiAttribute = 1 << iota
+	attrBootserviceAccess
+	attrRuntimeAccess
+)
+
+// IsUEFIBoot returns true if the system is booted using UEFI.
+func IsUEFIBoot() bool {
 	_, err := os.Stat("/sys/firmware/efi")
 	return err == nil
 }
 
-// getUKIAndPartitionInfo reads UKI file name and partition info from installed image
-// Returns UKI file name and blkid info from raw image file
-func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, error) {
+// SecureBootState represents the current Secure Boot status.
+type SecureBootState struct {
+	Enabled   bool // SecureBoot variable is 1
+	SetupMode bool // SetupMode variable is 1 (keys can be enrolled without authentication)
+}
+
+// GetSecureBootState reads the current Secure Boot state from UEFI variables.
+// Returns error if not running on UEFI system or variables cannot be read.
+func GetSecureBootState() (SecureBootState, error) {
+	if !IsUEFIBoot() {
+		return SecureBootState{}, errors.New("not a UEFI system")
+	}
+
+	state := SecureBootState{}
+
+	// Read SecureBoot variable (1 = enabled, 0 = disabled)
+	// Format: 4 bytes attributes + 1 byte value
+	sbPath := fmt.Sprintf("%s/SecureBoot-%s", efiVarsPath, scopeGlobal.String())
+	sbData, err := os.ReadFile(sbPath)
+	if err != nil {
+		return state, errors.Wrap(err, "failed to read SecureBoot variable")
+	}
+	if len(sbData) >= 5 {
+		state.Enabled = sbData[4] == 1
+	}
+
+	// Read SetupMode variable (1 = setup mode, 0 = user mode)
+	smPath := fmt.Sprintf("%s/SetupMode-%s", efiVarsPath, scopeGlobal.String())
+	smData, err := os.ReadFile(smPath)
+	if err != nil {
+		// SetupMode might not exist on all systems, not critical
+		return state, nil
+	}
+	if len(smData) >= 5 {
+		state.SetupMode = smData[4] == 1
+	}
+
+	return state, nil
+}
+
+// GetUKIAndPartitionInfo reads UKI file name and partition info from installed image.
+// Returns UKI file name and blkid info from raw image file.
+//
+//nolint:gocognit
+func GetUKIAndPartitionInfo(loopDevice, rawImage string) (string, any, error) {
 	// Try to find EFI partition on loop device
 	// Usually it's the first partition (p1 for loop devices)
 	var loopEfiPartition string
@@ -50,7 +108,7 @@ func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, e
 			if err == nil {
 				if strings.Contains(string(mounts), loopDevice) && strings.Contains(string(mounts), mp) {
 					loopEfiMountPoint = mp
-					needUnmount = false
+					needUnmount = false //nolint:ineffassign // used after break
 					log.Printf("using existing mount point %s for EFI partition", mp)
 					break
 				}
@@ -61,7 +119,7 @@ func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, e
 	// If not found, try to mount it ourselves
 	if loopEfiMountPoint == "" {
 		loopEfiMountPoint = "/tmp/loop-efi-mount-boot-to-talos"
-		os.MkdirAll(loopEfiMountPoint, 0o755)
+		_ = os.MkdirAll(loopEfiMountPoint, 0o755)
 		needUnmount = true
 
 		// Find EFI partition
@@ -76,13 +134,12 @@ func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, e
 						loopEfiPartition = candidate
 						break
 					}
-					unix.Unmount(loopEfiMountPoint, 0)
-				} else if err == unix.EBUSY {
+					_ = unix.Unmount(loopEfiMountPoint, 0)
+				} else if errors.Is(err, unix.EBUSY) {
 					// Partition is already mounted, try to find where
 					mounts, err := os.ReadFile("/proc/mounts")
 					if err == nil {
-						lines := strings.Split(string(mounts), "\n")
-						for _, line := range lines {
+						for line := range strings.SplitSeq(string(mounts), "\n") {
 							if strings.Contains(line, candidate) {
 								fields := strings.Fields(line)
 								if len(fields) >= 2 {
@@ -103,13 +160,13 @@ func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, e
 
 		if loopEfiPartition == "" && needUnmount {
 			os.RemoveAll(loopEfiMountPoint)
-			return "", nil, fmt.Errorf("failed to find EFI partition on loop device %s", loopDevice)
+			return "", nil, errors.Newf("failed to find EFI partition on loop device %s", loopDevice)
 		}
 
 		if needUnmount {
 			defer func() {
-				unix.Unmount(loopEfiMountPoint, 0)
-				os.RemoveAll(loopEfiMountPoint)
+				_ = unix.Unmount(loopEfiMountPoint, 0)
+				_ = os.RemoveAll(loopEfiMountPoint)
 			}()
 		}
 	}
@@ -117,11 +174,11 @@ func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, e
 	// Find UKI files in the installed image - same logic as sdboot.go
 	ukiFiles, err := filepath.Glob(filepath.Join(loopEfiMountPoint, "EFI", "Linux", "Talos-*.efi"))
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to find UKI files: %w", err)
+		return "", nil, errors.Wrap(err, "failed to find UKI files")
 	}
 
 	if len(ukiFiles) == 0 {
-		return "", nil, fmt.Errorf("no UKI files found in %s", filepath.Join(loopEfiMountPoint, "EFI", "Linux"))
+		return "", nil, errors.Newf("no UKI files found in %s", filepath.Join(loopEfiMountPoint, "EFI", "Linux"))
 	}
 
 	// Use the latest UKI file (assuming it's the one just installed)
@@ -134,23 +191,23 @@ func getUKIAndPartitionInfo(loopDevice, rawImage string) (string, interface{}, e
 	return ukiPath, nil, nil
 }
 
-// updateEFIVariables updates EFI variables after installation
-// This finds the Talos boot entry created by installer and updates BootOrder to put it first
-func updateEFIVariables(disk, ukiPath string, rawBlkidInfo interface{}) error {
+// UpdateEFIVariables updates EFI variables after installation.
+// This finds the Talos boot entry created by installer and updates BootOrder to put it first.
+func UpdateEFIVariables(disk, ukiPath string, rawBlkidInfo any) error {
 	// Create efivarfs reader/writer
 	efiRW, err := newEFIReaderWriter(true)
 	if err != nil {
-		return fmt.Errorf("failed to create efivarfs reader/writer: %w", err)
+		return errors.Wrap(err, "failed to create efivarfs reader/writer")
 	}
-	defer efiRW.Close() //nolint:errcheck
+	defer efiRW.Close()
 
 	// Get current BootOrder
 	bootOrder, err := getBootOrder(efiRW)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("failed to get BootOrder: %w", err)
+			return errors.Wrap(err, "failed to get BootOrder")
 		}
-		bootOrder = bootOrderType{}
+		bootOrder = BootOrderType{}
 	}
 
 	log.Printf("Current BootOrder: %v", bootOrder)
@@ -158,11 +215,11 @@ func updateEFIVariables(disk, ukiPath string, rawBlkidInfo interface{}) error {
 	// List all boot entries to find Talos entry
 	bootEntries, err := listBootEntries(efiRW)
 	if err != nil {
-		return fmt.Errorf("failed to list boot entries: %w", err)
+		return errors.Wrap(err, "failed to list boot entries")
 	}
 
 	// Find Talos boot entry index
-	var talosBootEntryIndex int = -1
+	talosBootEntryIndex := -1
 	for idx, entry := range bootEntries {
 		if entry.Description == "Talos Linux UKI" {
 			talosBootEntryIndex = idx
@@ -172,11 +229,11 @@ func updateEFIVariables(disk, ukiPath string, rawBlkidInfo interface{}) error {
 	}
 
 	if talosBootEntryIndex == -1 {
-		return fmt.Errorf("Talos boot entry not found")
+		return errors.New("Talos boot entry not found")
 	}
 
 	// Update BootOrder: put Talos entry first, then all others (excluding Talos entries)
-	newBootOrder := bootOrderType{uint16(talosBootEntryIndex)}
+	newBootOrder := BootOrderType{uint16(talosBootEntryIndex)}
 
 	// Add other entries (excluding Talos entries)
 	talosIndexSet := make(map[uint16]bool)
@@ -196,36 +253,14 @@ func updateEFIVariables(disk, ukiPath string, rawBlkidInfo interface{}) error {
 
 	// Update BootOrder
 	if err := setBootOrder(efiRW, newBootOrder); err != nil {
-		return fmt.Errorf("failed to set BootOrder: %w", err)
+		return errors.Wrap(err, "failed to set BootOrder")
 	}
 
 	log.Printf("BootOrder updated successfully, Talos entry %d is now first", talosBootEntryIndex)
 	return nil
 }
 
-/* -------------------- Local EFI variables implementation ------------------------------- */
-// These are local copies of efivarfs types and functions to avoid dependency on internal packages
-
-const (
-	efiVarsMountPoint = "/sys/firmware/efi/efivars"
-	efiVarsPath       = "/sys/firmware/efi/efivars"
-)
-
-var (
-	scopeSystemd = uuid.MustParse("4a67b082-0a4c-41cf-b6c7-440b29bb8c4f")
-	scopeGlobal  = uuid.MustParse("8be4df61-93ca-11d2-aa0d-00e098032b8c")
-)
-
-var efiEncoding = unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM)
-
-type efiAttribute uint32
-
-const (
-	attrNonVolatile efiAttribute = 1 << iota
-	attrBootserviceAccess
-	attrRuntimeAccess
-)
-
+// EFI variables reader/writer interface.
 type efiReadWriter interface {
 	Write(scope uuid.UUID, varName string, attrs efiAttribute, value []byte) error
 	Delete(scope uuid.UUID, varName string) error
@@ -242,7 +277,7 @@ func newEFIReaderWriter(write bool) (*efiFilesystemReaderWriter, error) {
 		// Remount efivarfs in read-write mode
 		// MS_REMOUNT = 0x20
 		if err := unix.Mount("efivarfs", efiVarsMountPoint, "efivarfs", 0x20, "rw"); err != nil {
-			return nil, fmt.Errorf("failed to remount efivarfs in read-write mode: %w", err)
+			return nil, errors.Wrap(err, "failed to remount efivarfs in read-write mode")
 		}
 	}
 	return &efiFilesystemReaderWriter{write: write}, nil
@@ -282,7 +317,7 @@ func (rw *efiFilesystemReaderWriter) Write(scope uuid.UUID, varName string, attr
 					log.Printf("warning: failed to clear immutable attribute: %v", errno)
 				}
 			}
-			f.Close() //nolint:errcheck
+			f.Close()
 		}
 	}
 
@@ -300,7 +335,7 @@ func (rw *efiFilesystemReaderWriter) Write(scope uuid.UUID, varName string, attr
 		if errors.As(err, &perr) {
 			e = perr.Err
 		}
-		return fmt.Errorf("writing %q in scope %s: %w", varName, scope, e)
+		return errors.Wrapf(e, "writing %q in scope %s", varName, scope)
 	}
 
 	// Linux wants everything in one write, so assemble an intermediate buffer
@@ -316,9 +351,9 @@ func (rw *efiFilesystemReaderWriter) Write(scope uuid.UUID, varName string, attr
 	// Try to restore immutable flag
 	if err == nil {
 		if f2, err2 := os.Open(path); err2 == nil {
-			var flags uint32 = 0x10                                                            // FS_IMMUTABLE_FL
-			unix.Syscall(unix.SYS_IOCTL, f2.Fd(), 0x40086602, uintptr(unsafe.Pointer(&flags))) //nolint:errcheck
-			f2.Close()                                                                         //nolint:errcheck
+			var flags uint32 = 0x10 // FS_IMMUTABLE_FL
+			_, _, _ = unix.Syscall(unix.SYS_IOCTL, f2.Fd(), 0x40086602, uintptr(unsafe.Pointer(&flags)))
+			f2.Close()
 		}
 	}
 
@@ -328,10 +363,10 @@ func (rw *efiFilesystemReaderWriter) Write(scope uuid.UUID, varName string, attr
 func (rw *efiFilesystemReaderWriter) Read(scope uuid.UUID, varName string) ([]byte, efiAttribute, error) {
 	val, err := os.ReadFile(varPath(scope, varName))
 	if err != nil {
-		return nil, 0, fmt.Errorf("reading %q in scope %s: %w", varName, scope, err)
+		return nil, 0, errors.Wrapf(err, "reading %q in scope %s", varName, scope)
 	}
 	if len(val) < 4 {
-		return nil, 0, fmt.Errorf("reading %q in scope %s: malformed, less than 4 bytes long", varName, scope)
+		return nil, 0, errors.Newf("reading %q in scope %s: malformed, less than 4 bytes long", varName, scope)
 	}
 	return val[4:], efiAttribute(binary.LittleEndian.Uint32(val[:4])), nil
 }
@@ -346,7 +381,7 @@ func (rw *efiFilesystemReaderWriter) Delete(scope uuid.UUID, varName string) err
 func (rw *efiFilesystemReaderWriter) List(scope uuid.UUID) ([]string, error) {
 	vars, err := os.ReadDir(efiVarsPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list variable directory: %w", err)
+		return nil, errors.Wrap(err, "failed to list variable directory")
 	}
 	var outVarNames []string
 	suffix := fmt.Sprintf("-%v", scope)
@@ -362,21 +397,22 @@ func (rw *efiFilesystemReaderWriter) List(scope uuid.UUID) ([]string, error) {
 	return outVarNames, nil
 }
 
-type bootOrderType []uint16
+// BootOrderType represents the UEFI BootOrder variable.
+type BootOrderType []uint16
 
-func unmarshalBootOrder(d []byte) (bootOrderType, error) {
+func unmarshalBootOrder(d []byte) (BootOrderType, error) {
 	if len(d)%2 != 0 {
-		return nil, fmt.Errorf("invalid length: %v bytes", len(d))
+		return nil, errors.Newf("invalid length: %v bytes", len(d))
 	}
 	l := len(d) / 2
-	out := make(bootOrderType, l)
+	out := make(BootOrderType, l)
 	for i := range l {
 		out[i] = binary.LittleEndian.Uint16(d[i*2:])
 	}
 	return out, nil
 }
 
-func (bo bootOrderType) marshal() []byte {
+func (bo BootOrderType) marshal() []byte {
 	var out []byte
 	for _, v := range bo {
 		out = binary.LittleEndian.AppendUint16(out, v)
@@ -384,7 +420,7 @@ func (bo bootOrderType) marshal() []byte {
 	return out
 }
 
-func getBootOrder(rw efiReadWriter) (bootOrderType, error) {
+func getBootOrder(rw efiReadWriter) (BootOrderType, error) {
 	raw, _, err := rw.Read(scopeGlobal, "BootOrder")
 	if err != nil {
 		return nil, err
@@ -392,7 +428,7 @@ func getBootOrder(rw efiReadWriter) (bootOrderType, error) {
 	return unmarshalBootOrder(raw)
 }
 
-func setBootOrder(rw efiReadWriter, ord bootOrderType) error {
+func setBootOrder(rw efiReadWriter, ord BootOrderType) error {
 	return rw.Write(scopeGlobal, "BootOrder", attrNonVolatile|attrRuntimeAccess, ord.marshal())
 }
 
@@ -415,7 +451,7 @@ func listBootEntries(rw efiReadWriter) (map[int]*loadOption, error) {
 	bootEntries := make(map[int]*loadOption)
 	varNames, err := rw.List(scopeGlobal)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list EFI variables: %w", err)
+		return nil, errors.Wrap(err, "failed to list EFI variables")
 	}
 
 	for _, varName := range varNames {
@@ -449,7 +485,7 @@ func getBootEntry(rw efiReadWriter, idx int) (*loadOption, error) {
 
 func unmarshalLoadOption(data []byte) (*loadOption, error) {
 	if len(data) < 6 {
-		return nil, fmt.Errorf("invalid load option: minimum 6 bytes are required, got %d", len(data))
+		return nil, errors.Newf("invalid load option: minimum 6 bytes are required, got %d", len(data))
 	}
 	nullIdx := bytes.Index(data[6:], []byte{0x00, 0x00})
 	if nullIdx == -1 {
@@ -459,9 +495,8 @@ func unmarshalLoadOption(data []byte) (*loadOption, error) {
 	descriptionRaw := data[6:descriptionEnd]
 	description, err := efiEncoding.NewDecoder().Bytes(descriptionRaw)
 	if err != nil {
-		return nil, fmt.Errorf("error decoding UTF-16 in Description: %w", err)
+		return nil, errors.Wrap(err, "error decoding UTF-16 in Description")
 	}
-	descriptionEnd += 2
 	opt := &loadOption{
 		Description: string(bytes.TrimSuffix(description, []byte{0})),
 	}
