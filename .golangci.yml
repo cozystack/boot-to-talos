@@ -1,0 +1,183 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    - depguard
+    - exhaustruct
+    - gochecknoinits
+    - wsl
+    - lll
+    - errchkjson
+    - ireturn
+    - gomoddirectives
+    - goconst      # String constants are clearer inline for CLI apps
+    - mnd          # Magic numbers are common in system programming (syscalls, permissions)
+    - varnamelen   # Short variable names are idiomatic in Go
+    - wsl_v5       # Whitespace style too strict
+    - nlreturn     # Newline before return too strict
+    - godot        # Comment periods not required
+    - godox        # TODOs are acceptable in development
+    - wrapcheck    # Not all errors need wrapping from stdlib
+    - gosec        # Many false positives for system programming
+    - nestif       # Nested ifs are necessary for complex logic
+    - revive       # Too many style opinions
+    - nonamedreturns
+    - perfsprint   # Printf style not critical
+    - noinlineerr  # Inline errors are fine
+    - unconvert    # Type conversions are explicit for clarity
+    - gocyclo      # Cyclomatic complexity - too strict for system code
+    - cyclop       # Same as gocyclo
+    - prealloc     # Preallocating slices is micro-optimization
+    - usetesting   # t.TempDir() suggestion is optional
+    - funcorder    # Method ordering is subjective
+  settings:
+    tagliatelle:
+      case:
+        use-field-name: true
+        extended-rules:
+          json:
+            case: camel
+            extra-initialisms: true
+            initialism-overrides:
+              ID: true
+              URL: true
+              CPU: true
+              RAM: true
+              NIC: true
+              IP: true
+              OS: true
+              VM: true
+              VR: true
+              VN: true
+              AR: true
+              VDC: true
+              ACL: true
+              LCM: true
+              DNS: true
+              ULA: true
+              API: true
+              UUID: true
+              MAC: true
+              UID: true
+              GID: true
+              DS: true
+              CMD: true
+              VNET: true
+              VCPU: true
+    dupl:
+      threshold: 100
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    gocritic:
+      disabled-checks:
+        - dupImport
+        - unnamedResult
+        - filepathJoin       # False positives with paths containing separators
+        - elseif             # Sometimes else-if is clearer than else if
+        - ifElseChain        # Sometimes if-else is clearer than switch
+        - exitAfterDefer     # Acceptable for fatal errors in CLI apps
+        - commentedOutCode   # Error code comments are documentation
+        - dupBranchBody      # Sometimes intentional for clarity
+        - whyNoLint          # Covered by nolintlint
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+    funlen:
+      lines: 120
+      statements: 100
+    gocyclo:
+      min-complexity: 15
+    cyclop:
+      max-complexity: 15
+    mnd:
+      ignored-numbers:
+        - "10"
+        - "100"
+        - "1000"
+        - "2"
+        - "60"
+        - "60.0"
+        - "64"
+        - "500"
+    nolintlint:
+      require-explanation: false
+      require-specific: true
+      allow-unused: false
+    varnamelen:
+      max-distance: 5
+      min-name-length: 3
+      check-receiver: false
+      check-return: false
+      ignore-type-assert-ok: false
+      ignore-map-index-ok: false
+      ignore-chan-recv-ok: false
+      ignore-decls:
+        - wg sync.WaitGroup
+        - wg *sync.WaitGroup
+        - mu sync.Mutex
+        - ok bool
+      ignore-names:
+        - i
+        - w
+        - r
+        - b
+        - c
+        - m
+        - n
+        - tt
+        - rw
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples/
+      - generated\.go$
+    rules:
+      - linters:
+          - funlen
+          - dupl
+          - gocognit
+          - gocyclo
+          - cyclop
+          - errcheck
+          - testableexamples
+          - testpackage
+          - forcetypeassert
+          - gocritic
+          - nlreturn
+          - wsl_v5
+          - varnamelen
+          - unparam
+          - modernize
+          - gosec
+          - testifylint
+          - perfsprint
+          - paralleltest
+          - maintidx
+          - godox
+          - revive
+          - gochecknoglobals
+        path: _test\.go
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples/
+      - generated\.go$
