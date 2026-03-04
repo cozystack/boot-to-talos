@@ -69,7 +69,7 @@ func main() {
 		}
 	}
 
-	// Collect kernel args for both modes
+	// Collect kernel args for both modes.
 	for _, e := range network.CollectKernelArgs() {
 		extra = append(extra, e)
 	}
