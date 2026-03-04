@@ -188,6 +188,19 @@ func handleKexecError(errno syscall.Errno) error {
 //
 //nolint:forbidigo
 func RunBootMode(source types.ImageSource, extraArgs []string) {
+	// Check for 5-level paging incompatibility (LA57 on amd64).
+	// Talos kernel is compiled without CONFIG_X86_5LEVEL, so kexec from a host
+	// with 5-level paging active will triple-fault during the paging transition.
+	if Is5LevelPagingActive() {
+		log.Fatal("kexec blocked: host kernel uses 5-level page tables (LA57) " +
+			"which is incompatible with Talos kernel.\n" +
+			"Talos is compiled without CONFIG_X86_5LEVEL, causing a triple fault during kexec.\n\n" +
+			"Workaround: add 'no5lvl' to host kernel command line and reboot:\n" +
+			"  1. Edit /etc/default/grub: add 'no5lvl' to GRUB_CMDLINE_LINUX\n" +
+			"  2. Run: update-grub && reboot\n" +
+			"  3. Re-run boot-to-talos")
+	}
+
 	// First show summary and ask for confirmation
 	fmt.Println("\nBoot Summary:")
 	fmt.Printf("  Image: %s\n", source.Reference())
