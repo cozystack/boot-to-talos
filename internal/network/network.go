@@ -573,31 +573,49 @@ func IfaceAddr(name string) (ip, mask string, err error) {
 	return
 }
 
-// PrettyName returns the predictable network interface name.
+// getPermanentMAC returns the permanent (hardware) MAC address of the interface.
+// This reads from /sys/class/net/<iface>/perm_addr which contains the original
+// hardware MAC address that doesn't change even if user modifies the active MAC.
+func getPermanentMAC(name string) (net.HardwareAddr, error) {
+	path := fmt.Sprintf("/sys/class/net/%s/perm_addr", name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	macStr := strings.TrimSpace(string(data))
+	return net.ParseMAC(macStr)
+}
+
+// macToInterfaceName converts a MAC address to a predictable interface name.
+// Format: enx<mac_without_colons_lowercase>
+// Example: e8:eb:d3:7e:38:3a -> enxe8ebd37e383a
+func macToInterfaceName(mac net.HardwareAddr) string {
+	// Convert MAC to hex string without colons
+	macHex := strings.ReplaceAll(mac.String(), ":", "")
+	return "enx" + strings.ToLower(macHex)
+}
+
+// PrettyName returns the predictable network interface name based on permanent MAC address.
+// Format: enx<mac> where mac is the permanent hardware MAC address without colons.
+// This ensures the interface name remains consistent across reboots even if
+// the user has modified the active MAC address.
 func PrettyName(name string) string {
+	// Try to get permanent MAC address first
+	mac, err := getPermanentMAC(name)
+	if err == nil && len(mac) > 0 {
+		return macToInterfaceName(mac)
+	}
+
+	// Fallback: try to get current MAC from interface
 	ifc, err := net.InterfaceByName(name)
 	if err != nil {
 		return name
 	}
-	p := fmt.Sprintf("/run/udev/data/n%d", ifc.Index)
+	if len(ifc.HardwareAddr) > 0 {
+		return macToInterfaceName(ifc.HardwareAddr)
+	}
 
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return name
-	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		if i := strings.IndexByte(line, ':'); i >= 0 {
-			line = line[i+1:]
-		}
-		switch {
-		case strings.HasPrefix(line, "ID_NET_NAME_ONBOARD="):
-			return strings.TrimPrefix(line, "ID_NET_NAME_ONBOARD=")
-		case strings.HasPrefix(line, "ID_NET_NAME_PATH="):
-			return strings.TrimPrefix(line, "ID_NET_NAME_PATH=")
-		case strings.HasPrefix(line, "ID_NET_NAME_SLOT="):
-			return strings.TrimPrefix(line, "ID_NET_NAME_SLOT=")
-		}
-	}
 	return name
 }
 
