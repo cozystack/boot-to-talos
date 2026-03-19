@@ -133,7 +133,7 @@ func KexecLoadFromAssets(assets *types.BootAssets, extraCmdline string) error {
 	const LINUX_REBOOT_MAGIC1 = 0xfee1dead
 	const LINUX_REBOOT_MAGIC2 = 672274793
 	_, _, errno2 := unix.Syscall6(
-		sysReboot, // arch-specific syscall number
+		sysReboot,              // arch-specific syscall number
 		LINUX_REBOOT_MAGIC1,    // magic1
 		LINUX_REBOOT_MAGIC2,    // magic2
 		LINUX_REBOOT_CMD_KEXEC, // cmd
@@ -188,6 +188,14 @@ func handleKexecError(errno syscall.Errno) error {
 //
 //nolint:forbidigo
 func RunBootMode(source types.ImageSource, extraArgs []string) {
+	// Check for 5-level paging incompatibility (LA57 on amd64).
+	// Talos kernel is compiled without CONFIG_X86_5LEVEL, so kexec from a host
+	// with 5-level paging active will triple-fault during the paging transition.
+	if Is5LevelPagingActive() {
+		HandleNo5LVLWorkaround()
+		return
+	}
+
 	// First show summary and ask for confirmation
 	fmt.Println("\nBoot Summary:")
 	fmt.Printf("  Image: %s\n", source.Reference())
