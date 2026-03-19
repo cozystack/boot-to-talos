@@ -268,29 +268,16 @@ cluster:
 	}
 	log.Print("Talos installer finished successfully")
 
-	// Get UKI file name and partition info from installed image (loop device) before copying
-	// We need this info to update EFI variables after copying
-	var ukiPath string
-	var rawBlkidInfo any
-	if efi.IsUEFIBoot() {
-		var err error
-		ukiPath, rawBlkidInfo, err = efi.GetUKIAndPartitionInfo(loop, raw)
-		if err != nil {
-			log.Printf("warning: failed to get UKI and partition info: %v", err)
-		}
-	}
-
 	log.Print("remounting all filesystems read-only")
 	_ = os.WriteFile("/proc/sysrq-trigger", []byte("u"), 0)
 
 	CopyWithFsync(raw, disk)
 	log.Printf("installation image copied to %s", disk)
 
-	// Update EFI variables AFTER copying image
-	// Update BootOrder to put Talos boot entry first (created by installer)
-	if efi.IsUEFIBoot() && ukiPath != "" {
-		log.Print("updating EFI variables")
-		if err := efi.UpdateEFIVariables(disk, ukiPath, rawBlkidInfo); err != nil {
+	// Create EFI boot entry pointing to the target disk's ESP
+	if efi.IsUEFIBoot() {
+		log.Print("creating EFI boot entry")
+		if err := efi.UpdateEFIVariables(disk); err != nil {
 			log.Printf("warning: failed to update EFI variables: %v", err)
 		}
 	}

@@ -11,11 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
+	"github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs/partition/gpt"
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 	"golang.org/x/text/encoding/unicode"
@@ -191,72 +194,99 @@ func GetUKIAndPartitionInfo(loopDevice, rawImage string) (string, any, error) {
 	return ukiPath, nil, nil
 }
 
-// UpdateEFIVariables updates EFI variables after installation.
-// This finds the Talos boot entry created by installer and updates BootOrder to put it first.
-func UpdateEFIVariables(disk, ukiPath string, rawBlkidInfo any) error {
-	// Create efivarfs reader/writer
+// UpdateEFIVariables creates a Talos boot entry pointing to the target disk's ESP
+// and updates BootOrder to put it first.
+func UpdateEFIVariables(disk string) error {
 	efiRW, err := newEFIReaderWriter(true)
 	if err != nil {
 		return errors.Wrap(err, "failed to create efivarfs reader/writer")
 	}
 	defer efiRW.Close()
 
-	// Get current BootOrder
-	bootOrder, err := getBootOrder(efiRW)
+	// Read GPT from target disk to find ESP
+	esp, err := getESPInfo(disk)
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return errors.Wrap(err, "failed to get BootOrder")
-		}
-		bootOrder = BootOrderType{}
+		return errors.Wrap(err, "failed to get ESP info from target disk")
 	}
 
-	log.Printf("Current BootOrder: %v", bootOrder)
+	log.Printf("found ESP: partition %d, start LBA %d, size %d blocks, UUID %s",
+		esp.PartitionNumber, esp.StartLBA, esp.SizeLBA, esp.PartitionGUID)
 
-	// List all boot entries to find Talos entry
+	// Determine EFI file path based on architecture
+	efiFilePath, err := sdbootFilePath()
+	if err != nil {
+		return err
+	}
+
+	// List existing boot entries to find existing Talos entry
 	bootEntries, err := listBootEntries(efiRW)
 	if err != nil {
 		return errors.Wrap(err, "failed to list boot entries")
 	}
 
-	// Find Talos boot entry index
-	talosBootEntryIndex := -1
+	// Find existing Talos entry or allocate new index
+	targetIdx := -1
 	for idx, entry := range bootEntries {
-		if entry.Description == "Talos Linux UKI" {
-			talosBootEntryIndex = idx
-			log.Printf("Found Talos boot entry at index %d", idx)
+		if entry.Description == talosBootEntryDescription {
+			targetIdx = idx
+			log.Printf("found existing Talos boot entry at index %d, will overwrite", idx)
+
 			break
 		}
 	}
 
-	if talosBootEntryIndex == -1 {
-		return errors.New("Talos boot entry not found")
-	}
-
-	// Update BootOrder: put Talos entry first, then all others (excluding Talos entries)
-	newBootOrder := BootOrderType{uint16(talosBootEntryIndex)}
-
-	// Add other entries (excluding Talos entries)
-	talosIndexSet := make(map[uint16]bool)
-	for idx := range bootEntries {
-		if bootEntries[idx].Description == "Talos Linux UKI" {
-			talosIndexSet[uint16(idx)] = true
+	if targetIdx < 0 {
+		targetIdx, err = findFreeBootIndex(efiRW)
+		if err != nil {
+			return errors.Wrap(err, "failed to find free boot index")
 		}
+
+		log.Printf("will create new boot entry at index %d", targetIdx)
 	}
+
+	// Build and write the boot entry
+	opt := &loadOption{
+		Description: talosBootEntryDescription,
+		FilePath: devicePath{
+			&hardDrivePath{
+				PartitionNumber:    esp.PartitionNumber,
+				PartitionStart:     esp.StartLBA,
+				PartitionSize:      esp.SizeLBA,
+				PartitionSignature: esp.PartitionGUID,
+			},
+			&filePathElem{Path: efiFilePath},
+			&endOfDevicePath{},
+		},
+	}
+
+	if err := setBootEntry(efiRW, targetIdx, opt); err != nil {
+		return errors.Wrapf(err, "failed to write boot entry at index %d", targetIdx)
+	}
+
+	// Update BootOrder: put new entry first, keep others without duplicates
+	bootOrder, err := getBootOrder(efiRW)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return errors.Wrap(err, "failed to get BootOrder")
+		}
+
+		bootOrder = BootOrderType{}
+	}
+
+	newBootOrder := BootOrderType{uint16(targetIdx)}
 
 	for _, idx := range bootOrder {
-		if !talosIndexSet[idx] {
+		if idx != uint16(targetIdx) {
 			newBootOrder = append(newBootOrder, idx)
 		}
 	}
 
-	log.Printf("New BootOrder: %v", newBootOrder)
-
-	// Update BootOrder
 	if err := setBootOrder(efiRW, newBootOrder); err != nil {
 		return errors.Wrap(err, "failed to set BootOrder")
 	}
 
-	log.Printf("BootOrder updated successfully, Talos entry %d is now first", talosBootEntryIndex)
+	log.Printf("EFI boot entry %04X created, BootOrder: %v", targetIdx, newBootOrder)
+
 	return nil
 }
 
@@ -501,4 +531,240 @@ func unmarshalLoadOption(data []byte) (*loadOption, error) {
 		Description: string(bytes.TrimSuffix(description, []byte{0})),
 	}
 	return opt, nil
+}
+
+const talosBootEntryDescription = "Talos Linux UKI"
+
+// loadOptionActive is the LOAD_OPTION_ACTIVE attribute bit.
+const loadOptionActive = 0x00000001
+
+func (lo *loadOption) marshal() ([]byte, error) {
+	// Encode description to UTF-16LE with null terminator
+	descBytes, err := efiEncoding.NewEncoder().Bytes([]byte(lo.Description))
+	if err != nil {
+		return nil, errors.Wrap(err, "encoding description to UTF-16LE")
+	}
+
+	descBytes = append(descBytes, 0x00, 0x00) // null terminator
+
+	// Serialize device path elements
+	var filePathList []byte
+
+	for _, elem := range lo.FilePath {
+		elemData, err := elem.data()
+		if err != nil {
+			return nil, errors.Wrap(err, "serializing device path element")
+		}
+
+		filePathList = append(filePathList, elemData...)
+	}
+
+	// Build load option: Attributes(4) + FilePathListLength(2) + Description + FilePathList
+	buf := make([]byte, 4+2+len(descBytes)+len(filePathList))
+	binary.LittleEndian.PutUint32(buf[0:4], loadOptionActive)
+	binary.LittleEndian.PutUint16(buf[4:6], uint16(len(filePathList)))
+	copy(buf[6:], descBytes)
+	copy(buf[6+len(descBytes):], filePathList)
+
+	return buf, nil
+}
+
+// hardDrivePath represents UEFI Hard Drive Media Device Path (Type 0x04, SubType 0x01).
+type hardDrivePath struct {
+	PartitionNumber    uint32
+	PartitionStart     uint64    // in logical blocks
+	PartitionSize      uint64    // in logical blocks
+	PartitionSignature uuid.UUID // partition GUID
+}
+
+const (
+	dpTypeMedia       = 0x04
+	dpSubTypeHardDrive = 0x01
+	dpSubTypeFilePath = 0x04
+	dpTypeEnd         = 0x7F
+	dpSubTypeEnd      = 0xFF
+	hardDrivePathLen  = 42 // 4-byte header + 38-byte data
+
+	gptMBRType       = 0x02
+	gptSignatureType = 0x02
+)
+
+func (h *hardDrivePath) typ() uint8     { return dpTypeMedia }
+func (h *hardDrivePath) subType() uint8 { return dpSubTypeHardDrive }
+
+func (h *hardDrivePath) data() ([]byte, error) {
+	buf := make([]byte, hardDrivePathLen)
+	buf[0] = dpTypeMedia
+	buf[1] = dpSubTypeHardDrive
+	binary.LittleEndian.PutUint16(buf[2:4], hardDrivePathLen)
+	binary.LittleEndian.PutUint32(buf[4:8], h.PartitionNumber)
+	binary.LittleEndian.PutUint64(buf[8:16], h.PartitionStart)
+	binary.LittleEndian.PutUint64(buf[16:24], h.PartitionSize)
+	copy(buf[24:40], guidToMixedEndian(h.PartitionSignature))
+	buf[40] = gptMBRType
+	buf[41] = gptSignatureType
+
+	return buf, nil
+}
+
+// filePathElem represents UEFI File Path Media Device Path (Type 0x04, SubType 0x04).
+type filePathElem struct {
+	Path string // e.g., `\EFI\boot\BOOTX64.efi`
+}
+
+func (f *filePathElem) typ() uint8     { return dpTypeMedia }
+func (f *filePathElem) subType() uint8 { return dpSubTypeFilePath }
+
+func (f *filePathElem) data() ([]byte, error) {
+	// Convert forward slashes to backslashes
+	path := strings.ReplaceAll(f.Path, "/", "\\")
+
+	pathBytes, err := efiEncoding.NewEncoder().Bytes([]byte(path))
+	if err != nil {
+		return nil, errors.Wrap(err, "encoding file path to UTF-16LE")
+	}
+
+	pathBytes = append(pathBytes, 0x00, 0x00) // null terminator
+
+	totalLen := 4 + len(pathBytes)
+	buf := make([]byte, totalLen)
+	buf[0] = dpTypeMedia
+	buf[1] = dpSubTypeFilePath
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(totalLen))
+	copy(buf[4:], pathBytes)
+
+	return buf, nil
+}
+
+// endOfDevicePath represents UEFI End of Device Path (Type 0x7F, SubType 0xFF).
+type endOfDevicePath struct{}
+
+func (e *endOfDevicePath) typ() uint8     { return dpTypeEnd }
+func (e *endOfDevicePath) subType() uint8 { return dpSubTypeEnd }
+
+func (e *endOfDevicePath) data() ([]byte, error) {
+	return []byte{dpTypeEnd, dpSubTypeEnd, 0x04, 0x00}, nil
+}
+
+// guidToMixedEndian converts a uuid.UUID (RFC 4122, big-endian time fields)
+// to UEFI mixed-endian format (little-endian for first 3 groups).
+func guidToMixedEndian(id uuid.UUID) []byte {
+	out := make([]byte, 16)
+	copy(out, id[:])
+	// Reverse bytes 0-3 (time_low)
+	out[0], out[1], out[2], out[3] = id[3], id[2], id[1], id[0]
+	// Reverse bytes 4-5 (time_mid)
+	out[4], out[5] = id[5], id[4]
+	// Reverse bytes 6-7 (time_hi_and_version)
+	out[6], out[7] = id[7], id[6]
+	// Bytes 8-15 stay as-is
+
+	return out
+}
+
+func setBootEntry(rw efiReadWriter, idx int, opt *loadOption) error {
+	data, err := opt.marshal()
+	if err != nil {
+		return errors.Wrap(err, "marshaling load option")
+	}
+
+	return rw.Write(scopeGlobal, fmt.Sprintf("Boot%04X", idx), attrNonVolatile|attrRuntimeAccess, data)
+}
+
+func findFreeBootIndex(rw efiReadWriter) (int, error) {
+	varNames, err := rw.List(scopeGlobal)
+	if err != nil {
+		return 0, errors.Wrap(err, "listing EFI variables")
+	}
+
+	usedIndices := make(map[int]bool)
+
+	for _, varName := range varNames {
+		s := bootVarRegexp.FindStringSubmatch(varName)
+		if s == nil {
+			continue
+		}
+
+		idx, err := strconv.ParseUint(s[1], 16, 16)
+		if err != nil {
+			continue
+		}
+
+		usedIndices[int(idx)] = true
+	}
+
+	for i := range 0x10000 {
+		if !usedIndices[i] {
+			return i, nil
+		}
+	}
+
+	return 0, errors.New("no free boot entry index available")
+}
+
+// espInfo contains information about the EFI System Partition on a disk.
+type espInfo struct {
+	PartitionNumber uint32
+	StartLBA        uint64
+	SizeLBA         uint64
+	PartitionGUID   uuid.UUID
+}
+
+func getESPInfo(diskPath string) (*espInfo, error) {
+	d, err := diskfs.Open(diskPath, diskfs.WithOpenMode(diskfs.ReadOnly))
+	if err != nil {
+		return nil, errors.Wrapf(err, "opening disk %s", diskPath)
+	}
+	defer d.Close()
+
+	table, err := d.GetPartitionTable()
+	if err != nil {
+		return nil, errors.Wrap(err, "reading partition table")
+	}
+
+	gptTable, ok := table.(*gpt.Table)
+	if !ok {
+		return nil, errors.New("disk does not have a GPT partition table")
+	}
+
+	for i, part := range gptTable.Partitions {
+		if part == nil {
+			continue
+		}
+
+		if part.Type != gpt.EFISystemPartition {
+			continue
+		}
+
+		partGUID, err := uuid.Parse(part.GUID)
+		if err != nil {
+			return nil, errors.Wrapf(err, "parsing partition GUID %q", part.GUID)
+		}
+
+		sectorSize := uint64(gptTable.LogicalSectorSize)
+		if sectorSize == 0 {
+			sectorSize = 512
+		}
+
+		return &espInfo{
+			PartitionNumber: uint32(i + 1),
+			StartLBA:        part.Start,
+			SizeLBA:         part.Size / sectorSize,
+			PartitionGUID:   partGUID,
+		}, nil
+	}
+
+	return nil, errors.Newf("EFI System Partition not found on %s", diskPath)
+}
+
+// sdbootFilePath returns the EFI file path for sd-boot based on architecture.
+func sdbootFilePath() (string, error) {
+	switch runtime.GOARCH {
+	case "amd64":
+		return `\EFI\boot\BOOTX64.efi`, nil
+	case "arm64":
+		return `\EFI\boot\BOOTAA64.efi`, nil
+	default:
+		return "", errors.Newf("unsupported architecture: %s", runtime.GOARCH)
+	}
 }
