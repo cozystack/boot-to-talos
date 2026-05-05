@@ -26,7 +26,7 @@ var (
 
 func init() {
 	flag.StringVar(&imageFlag, "image",
-		"ghcr.io/cozystack/cozystack/talos:v1.11.6", "Talos installer image")
+		"ghcr.io/cozystack/cozystack/talos:v1.12.6", "Talos installer image")
 	flag.StringVar(&diskFlag, "disk", "", "target disk (will be wiped)")
 	flag.BoolVar(&cli.YesFlag, "yes", false, "automatic yes to prompts")
 	flag.StringVar(&modeFlag, "mode", "", "mode: boot or install")
