@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -444,7 +445,12 @@ func LACPRateToString(rate uint8) string {
 
 // GenerateBondCmdline generates kernel cmdline for bond configuration.
 // Format: bond=<bondname>:<slaves>:<options>
-func GenerateBondCmdline(info *NetworkInfo, bond *LinkInfo, bondName string) string {
+//
+// When verbatim is true, slave names are emitted as-is (skipping the
+// perm_addr-based PrettyName rewrite) — used on the --override-interface path
+// so the entire cmdline carries user-supplied names instead of partially
+// rewriting slaves into enx<mac>-style names.
+func GenerateBondCmdline(info *NetworkInfo, bond *LinkInfo, bondName string, verbatim bool) string {
 	if bond == nil || !bond.IsBond() || bond.BondMaster == nil {
 		return ""
 	}
@@ -455,10 +461,16 @@ func GenerateBondCmdline(info *NetworkInfo, bond *LinkInfo, bondName string) str
 		return ""
 	}
 
-	// Build slave list using predictable names
+	// Build slave list. Under verbatim mode the user has signed off on the
+	// link names already (override is active), so do not run them through
+	// PrettyName.
 	var slaveNames []string
 	for _, slave := range slaves {
-		slaveNames = append(slaveNames, PrettyName(slave.Name))
+		if verbatim {
+			slaveNames = append(slaveNames, slave.Name)
+		} else {
+			slaveNames = append(slaveNames, prettyNameFn(slave.Name))
+		}
 	}
 
 	// Build options
@@ -641,32 +653,87 @@ func GetHostname() string {
 	return hostname
 }
 
-// CollectKernelArgs collects kernel arguments for network configuration.
-func CollectKernelArgs() []string {
+// Injected helpers — package-level vars so tests can swap real OS-backed
+// lookups for stubs without standing up a netlink runtime. fatalf wraps
+// log.Fatalf so tests can intercept process-terminating failures (e.g. the
+// fail-loud guard on -yes + override + missing-IPv4).
+//
+//nolint:gochecknoglobals
+var (
+	defaultRouteFn       = DefaultRoute
+	ifaceAddrFn          = IfaceAddr
+	prettyNameFn         = PrettyName
+	collectNetworkInfoFn = CollectNetworkInfo
+	fatalf               = log.Fatalf
+)
+
+// CollectKernelArgs collects networking-related kernel cmdline arguments.
+// overrideIface, when non-empty, replaces the auto-detected default-route
+// device — the escape hatch for VLAN / bond topologies where the netlink
+// or /proc/net/route probe does not converge on the right child interface.
+// Both detection paths honour the override.
+func CollectKernelArgs(overrideIface string) []string {
 	// Try netlink-based detection first (supports bond/bridge)
-	if args := collectKernelArgsNetlink(); args != nil {
+	if args := collectKernelArgsNetlink(overrideIface); args != nil {
 		return args
 	}
 
 	// Fallback to simple detection
-	return collectKernelArgsSimple()
+	return collectKernelArgsSimple(overrideIface)
+}
+
+// pickInterface returns the network device to use, plus a bool indicating
+// whether the override path was taken. Extracted so the override-vs-detect
+// decision is unit-testable without a netlink runtime.
+func pickInterface(override, detected string) (dev string, fromOverride bool) {
+	if override != "" {
+		return override, true
+	}
+	return detected, false
+}
+
+// vlanParentName resolves the cmdline name of a VLAN's parent link. When
+// fromOverride is true, raw link names are used (skipping the perm_addr-based
+// PrettyName rewrite) so a user override reaches the kernel cmdline verbatim.
+// When the parent is a bond that matches the active actualDevice, the
+// caller-supplied bondName is preferred so the cmdline references whatever
+// the bond block named the master.
+func vlanParentName(parent, actualDevice *LinkInfo, bondName string, fromOverride bool) string {
+	if parent == nil {
+		return "unknown"
+	}
+	if parent.IsBond() && actualDevice != nil && actualDevice.IsBond() {
+		return bondName
+	}
+	if fromOverride {
+		return parent.Name
+	}
+	return prettyNameFn(parent.Name)
 }
 
 //nolint:gocognit,forbidigo,funlen
-func collectKernelArgsNetlink() []string {
+func collectKernelArgsNetlink(overrideIface string) []string {
 	// Try to collect network info via netlink
-	netInfo, err := CollectNetworkInfo()
+	netInfo, err := collectNetworkInfoFn()
 	if err != nil {
 		log.Printf("warning: failed to collect network info via netlink: %v", err)
 		log.Printf("falling back to simple detection")
 		return nil // Will use fallback
 	}
 
-	// Find default route interface
-	dev, gw, err := DefaultRoute()
-	if err != nil {
-		log.Printf("warning: no default route found: %v", err)
+	// Find default route interface, honouring the override when set.
+	detectedDev, gw, drErr := defaultRouteFn()
+	dev, fromOverride := pickInterface(overrideIface, detectedDev)
+	if !fromOverride && drErr != nil {
+		log.Printf("warning: no default route found: %v", drErr)
 		return nil
+	}
+	if fromOverride {
+		log.Printf("using override interface %s (auto-detected was %q, default route err=%v)",
+			dev, detectedDev, drErr)
+		if drErr != nil {
+			log.Printf("warning: no default route — gateway will be empty unless answered interactively")
+		}
 	}
 
 	// Get link info for the interface
@@ -686,9 +753,14 @@ func collectKernelArgsNetlink() []string {
 	}
 
 	// Get IP address and mask
-	ip, mask, err := IfaceAddr(dev)
+	ip, mask, err := ifaceAddrFn(dev)
 	if err != nil {
-		log.Printf("warning: failed to get IP address for %s: %v", dev, err)
+		if fromOverride {
+			log.Printf("warning: failed to read IPv4 address for override interface %q: %v "+
+				"— falling back to simple detection", dev, err)
+		} else {
+			log.Printf("warning: failed to get IP address for %s: %v", dev, err)
+		}
 		return nil
 	}
 
@@ -704,7 +776,15 @@ func collectKernelArgsNetlink() []string {
 	// If there's a VLAN, the IP goes on the VLAN interface
 	// If there's a bond, the IP goes on the bond (or VLAN on bond)
 	var ipDevice string
+	// Default bond master name in the kernel cmdline. When fromOverride is
+	// true and the override resolves to a bond master, replace this with
+	// the override so the bond=/ip= lines stay internally consistent
+	// (otherwise the kernel would create "bond0" from the bond= line while
+	// the ip= line points at a non-existent override name).
 	bondName := "bond0"
+	if fromOverride && actualDevice.IsBond() {
+		bondName = actualDevice.Name
+	}
 
 	// Handle bond
 	if actualDevice.IsBond() {
@@ -716,7 +796,7 @@ func collectKernelArgsNetlink() []string {
 				if i > 0 {
 					fmt.Printf(", ")
 				}
-				fmt.Printf("%s (%s)", s.Name, PrettyName(s.Name))
+				fmt.Printf("%s (%s)", s.Name, prettyNameFn(s.Name))
 			}
 			fmt.Println()
 		}
@@ -729,15 +809,28 @@ func collectKernelArgsNetlink() []string {
 		}
 
 		// Generate bond cmdline
-		bondCmdline := GenerateBondCmdline(netInfo, actualDevice, bondName)
+		bondCmdline := GenerateBondCmdline(netInfo, actualDevice, bondName, fromOverride)
 		if bondCmdline != "" {
 			out = append(out, bondCmdline)
 		}
-		ipDevice = bondName
+		if fromOverride {
+			ipDevice = overrideIface
+			fmt.Printf("Bond IP device: %s (override active, bond master = %s)\n", ipDevice, bondName)
+		} else {
+			ipDevice = bondName
+		}
 	} else {
-		// Regular interface
-		ipDevice = PrettyName(actualDevice.Name)
-		fmt.Printf("\nDetected interface: %s (%s)\n", actualDevice.Name, ipDevice)
+		// Regular interface. Skip the perm_addr-based rewrite for an
+		// explicit override so the user-supplied name (often a VLAN child)
+		// reaches the kernel cmdline verbatim.
+		if fromOverride {
+			ipDevice = overrideIface
+			fmt.Printf("\nDetected interface: %s (override active, using %s verbatim)\n",
+				actualDevice.Name, overrideIface)
+		} else {
+			ipDevice = prettyNameFn(actualDevice.Name)
+			fmt.Printf("\nDetected interface: %s (%s)\n", actualDevice.Name, ipDevice)
+		}
 	}
 
 	// Handle VLANs
@@ -746,14 +839,11 @@ func collectKernelArgsNetlink() []string {
 		for _, vlan := range vlans {
 			if vlan.VLAN != nil {
 				parent := netInfo.GetLinkByIndex(vlan.LinkIndex)
-				parentName := "unknown"
-				if parent != nil {
-					if parent.IsBond() && actualDevice.IsBond() {
-						parentName = bondName
-					} else {
-						parentName = PrettyName(parent.Name)
-					}
-				}
+				// Display name matches what the cmdline will carry — route
+				// through the same vlanParentName helper used below so the
+				// human-readable preamble does not diverge from the emitted
+				// vlan=/ip= lines under override.
+				parentName := vlanParentName(parent, actualDevice, bondName, fromOverride)
 				fmt.Printf("  VLAN %d on %s (interface: %s)\n", vlan.VLAN.VID, parentName, vlan.Name)
 			}
 		}
@@ -761,29 +851,30 @@ func collectKernelArgsNetlink() []string {
 
 		// Generate VLAN cmdlines (in reverse order - from lowest to topmost)
 		// This ensures parent interfaces are created before child VLANs
-		for i := len(vlans) - 1; i >= 0; i-- {
-			vlan := vlans[i]
+		for i, vlan := range slices.Backward(vlans) {
 			if vlan.VLAN == nil {
 				continue
 			}
 
-			// Determine VLAN device name for Talos
-			// Format: <parent>.<vid>
+			// Determine VLAN device name for Talos.
+			// When fromOverride, names go through verbatim (no PrettyName
+			// rewrite) so the user-supplied leaf reaches the kernel cmdline
+			// unchanged. Format: <parent>.<vid>.
 			parent := netInfo.GetLinkByIndex(vlan.LinkIndex)
-			var parentName string
-			if parent != nil {
-				if parent.IsBond() && actualDevice.IsBond() {
-					parentName = bondName
-				} else if parent.IsVLAN() {
-					// Nested VLAN - find the previous VLAN's name
-					// For now, use predictable name
-					parentName = PrettyName(parent.Name)
-				} else {
-					parentName = PrettyName(parent.Name)
-				}
-			}
+			parentName := vlanParentName(parent, actualDevice, bondName, fromOverride)
 
 			vlanName := fmt.Sprintf("%s.%d", parentName, vlan.VLAN.VID)
+			// The topmost VLAN (i == 0 after Backward) is the leaf — if an
+			// override is active, honour the user-supplied name verbatim
+			// rather than the derived <parent>.<vid> form. For the common
+			// case where the user passes "eth0.10" the two forms agree, but
+			// this branch covers the rarer case where the runtime link name
+			// does not follow the dotted convention (e.g. ifrename'd VLAN
+			// interfaces) and the user is telling us the exact kernel name
+			// they expect on the cmdline.
+			if i == 0 && fromOverride {
+				vlanName = overrideIface
+			}
 			vlanCmdline := fmt.Sprintf("vlan=%s:%s", vlanName, parentName)
 			out = append(out, vlanCmdline)
 
@@ -820,10 +911,36 @@ func collectKernelArgsNetlink() []string {
 	return out
 }
 
-func collectKernelArgsSimple() []string {
-	dev, gw, _ := DefaultRoute()
-	ip, mask, _ := IfaceAddr(dev)
-	dev = PrettyName(dev)
+func collectKernelArgsSimple(overrideIface string) []string {
+	detectedDev, gw, drErr := defaultRouteFn()
+	dev, fromOverride := pickInterface(overrideIface, detectedDev)
+	if fromOverride {
+		log.Printf("using override interface %s (auto-detected was %q)", dev, detectedDev)
+		if drErr != nil {
+			log.Printf("warning: no default route — gateway will be empty unless answered interactively")
+		}
+	}
+	ip, mask, ifErr := ifaceAddrFn(dev)
+	if fromOverride && ifErr != nil {
+		if cli.YesFlag {
+			// Non-interactive caller asked for an override interface that
+			// has no IPv4 address; emitting an ip= line with empty fields
+			// would silently produce a broken Talos install. Fail loudly
+			// so the operator sees the problem now, not after a reboot
+			// into a node without networking.
+			fatalf("override interface %q has no IPv4 address: %v "+
+				"(refusing to emit a broken ip= line under -yes)", dev, ifErr)
+		}
+		log.Printf("warning: failed to read IPv4 address for override interface %q: %v "+
+			"— ip/mask will be empty unless answered interactively", dev, ifErr)
+	}
+	// Skip the perm_addr-based rewrite for an explicit override: the user
+	// passed a specific interface name (often a VLAN child like eth0.10
+	// that inherits its parent's MAC) and the kernel cmdline must carry
+	// that exact name.
+	if !fromOverride {
+		dev = prettyNameFn(dev)
+	}
 	hostname := GetHostname()
 
 	netOn := cli.AskYesNo("Add networking configuration?", true)

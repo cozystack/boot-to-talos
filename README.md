@@ -170,8 +170,17 @@ boot-to-talos -yes -disk /dev/sda -image ghcr.io/cozystack/cozystack/talos:v1.10
 | `-image string`       | Talos image (container ref, ISO path, RAW path, or HTTP URL)       | `-image ghcr.io/cozystack/cozystack/talos:v1.11` |
 | `-image-size-gib uint`| Size of image.raw in GiB (default: 3)                              | `-image-size-gib 4`                             |
 | `-extra-kernel-arg value` | Extra kernel argument (can be repeated)                        | `-extra-kernel-arg "console=ttyS0"`             |
+| `-override-interface string` | Override the network interface used to generate the Talos kernel cmdline `ip=`/`vlan=` args (does not affect the tool's own network I/O). Pass a VLAN / bond child interface name when the netlink probe picks the wrong device, especially with `-yes`. | `-override-interface eth0.10` |
 
 **Tip:** All flags can be combined. If a flag is not provided, the installer will prompt for input (unless `-yes` is used).
+
+### Overriding the network interface
+
+The default-route interface is auto-detected from netlink and `/proc/net/route`. On hosts where the auto-detection picks the wrong device — most commonly a VLAN sub-interface or a bond child — pass `-override-interface` to force the kernel-args generator to use a specific link. This is the recommended escape hatch for non-interactive (`-yes`) installs over VLAN:
+
+```console
+boot-to-talos -yes -mode install -disk /dev/sda -override-interface eth0.10
+```
 
 ---
 
