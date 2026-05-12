@@ -133,7 +133,7 @@ func (s *ISOSource) GetBootAssets() (*types.BootAssets, error) {
 // finalised without Rock Ridge. Directory entries whose name happens to end in
 // ".efi" are skipped: a directory cannot be opened as a UKI by the caller.
 func findUKIInISO(fs filesystem.FileSystem) (string, error) {
-	candidates := []string{"EFI/BOOT", "efi/boot"}
+	candidates := []string{"EFI/BOOT", "EFI/boot", "efi/boot"}
 	seen := make(map[string]struct{}, len(candidates)*2)
 	searchPaths := make([]string, 0, len(candidates)*2)
 	for _, p := range candidates {
