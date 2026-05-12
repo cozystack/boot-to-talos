@@ -19,9 +19,10 @@ import (
 
 //nolint:gochecknoglobals
 var (
-	imageFlag string
-	diskFlag  string
-	modeFlag  string
+	imageFlag         string
+	diskFlag          string
+	modeFlag          string
+	overrideIfaceFlag string
 )
 
 func init() {
@@ -30,6 +31,10 @@ func init() {
 	flag.StringVar(&diskFlag, "disk", "", "target disk (will be wiped)")
 	flag.BoolVar(&cli.YesFlag, "yes", false, "automatic yes to prompts")
 	flag.StringVar(&modeFlag, "mode", "", "mode: boot or install")
+	flag.StringVar(&overrideIfaceFlag, "override-interface", "",
+		"override the network interface used to generate the Talos kernel "+
+			"cmdline ip=/vlan= args (does not affect the tool's own network I/O); "+
+			"pass the VLAN/bond child interface name when autodetect picks the wrong device")
 }
 
 func main() {
@@ -70,7 +75,7 @@ func main() {
 	}
 
 	// Collect kernel args for both modes.
-	for _, e := range network.CollectKernelArgs() {
+	for _, e := range network.CollectKernelArgs(overrideIfaceFlag) {
 		extra = append(extra, e)
 	}
 
