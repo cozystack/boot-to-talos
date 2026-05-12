@@ -1,0 +1,66 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:enableMajor",
+    ":separateMajorReleases",
+    ":prHourlyLimitNone",
+    ":prConcurrentLimitNone",
+    ":semanticCommitTypeAll(chore)",
+    "schedule:weekly"
+  ],
+  "labels": ["dependencies"],
+  "ignorePaths": ["**/vendor/**"],
+  "automerge": false,
+  "platformAutomerge": false,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 4am on monday"]
+  },
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "dependencies"]
+  },
+  "packageRules": [
+    {
+      "description": "Group all Go module updates",
+      "matchManagers": ["gomod"],
+      "groupName": "go modules",
+      "groupSlug": "go-modules"
+    },
+    {
+      "description": "Group all GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "groupSlug": "github-actions"
+    },
+    {
+      "description": "Bump the go directive and toolchain directive in go.mod as their own PR (distinct group name so the toolchain bump is not folded into the grouped module updates). The gomod manager emits depType: golang for the go directive and depType: toolchain for the toolchain directive, so both must be matched. Major Go releases arrive as a separate PR via :separateMajorReleases.",
+      "matchManagers": ["gomod"],
+      "matchDepNames": ["go"],
+      "matchDepTypes": ["golang", "toolchain"],
+      "rangeStrategy": "bump",
+      "groupName": "go toolchain",
+      "groupSlug": "go-toolchain"
+    },
+    {
+      "description": "Talos installer image — pinned to no-automerge even if a global automerge default is added later, since this package controls the user-facing default install image.",
+      "matchPackageNames": ["ghcr.io/cozystack/cozystack/talos"],
+      "automerge": false,
+      "labels": ["dependencies", "talos"]
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Default Talos installer image hard-coded in cmd/boot-to-talos/main.go",
+      "customType": "regex",
+      "managerFilePatterns": ["cmd/boot-to-talos/main.go"],
+      "matchStrings": [
+        "(?<depName>ghcr\\.io/cozystack/cozystack/talos):(?<currentValue>v\\d+\\.\\d+(?:\\.\\d+)?(?:-[\\w.]+)?)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    }
+  ]
+}
