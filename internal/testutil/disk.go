@@ -28,6 +28,7 @@ func CreateTestRAWImage(path string, sizeMB int64, files map[string][]byte) erro
 		ProtectiveMBR: true,
 		Partitions: []*gpt.Partition{
 			{
+				Index: 1,
 				Start: 2048,
 				End:   uint64(sizeMB*1024*1024/512) - 34,
 				Type:  gpt.EFISystemPartition,
@@ -52,21 +53,25 @@ func CreateTestRAWImage(path string, sizeMB int64, files map[string][]byte) erro
 		return err
 	}
 
-	// Write files to filesystem
+	// Write files to filesystem. go-diskfs v1.9+ follows io/fs.ValidPath and
+	// rejects paths with a leading slash, so we strip it before every Mkdir/OpenFile.
 	for filePath, content := range files {
-		// Create parent directories recursively
-		dir := filepath.Dir(filePath)
-		if dir != "/" && dir != "." {
-			// Split path and create each directory
-			parts := strings.Split(strings.TrimPrefix(dir, "/"), "/")
+		relPath := strings.TrimPrefix(filePath, "/")
+		dir := filepath.Dir(relPath)
+		if dir != "." && dir != "" {
+			parts := strings.Split(dir, "/")
 			currentPath := ""
 			for _, part := range parts {
-				currentPath = currentPath + "/" + part
+				if currentPath == "" {
+					currentPath = part
+				} else {
+					currentPath = currentPath + "/" + part
+				}
 				_ = fs.Mkdir(currentPath) // Ignore error if exists
 			}
 		}
 
-		f, err := fs.OpenFile(filePath, os.O_CREATE|os.O_RDWR)
+		f, err := fs.OpenFile(relPath, os.O_CREATE|os.O_RDWR)
 		if err != nil {
 			return err
 		}

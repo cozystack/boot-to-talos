@@ -127,11 +127,26 @@ func (s *ISOSource) GetBootAssets() (*types.BootAssets, error) {
 	return s.extractKernelInitrdFromISO(fs)
 }
 
-// findUKIInISO searches for UKI file in ISO filesystem.
+// findUKIInISO searches for UKI file in ISO filesystem. Paths have no leading
+// slash to satisfy io/fs.ValidPath semantics adopted in go-diskfs v1.9, and
+// each search candidate is also tried upper-cased to handle ISO9660 images
+// finalised without Rock Ridge. Directory entries whose name happens to end in
+// ".efi" are skipped: a directory cannot be opened as a UKI by the caller.
 func findUKIInISO(fs filesystem.FileSystem) (string, error) {
-	searchPaths := []string{
-		"/EFI/BOOT",
-		"/efi/boot",
+	candidates := []string{"EFI/BOOT", "efi/boot"}
+	seen := make(map[string]struct{}, len(candidates)*2)
+	searchPaths := make([]string, 0, len(candidates)*2)
+	for _, p := range candidates {
+		if _, ok := seen[p]; !ok {
+			seen[p] = struct{}{}
+			searchPaths = append(searchPaths, p)
+		}
+		if upper := strings.ToUpper(p); upper != p {
+			if _, ok := seen[upper]; !ok {
+				seen[upper] = struct{}{}
+				searchPaths = append(searchPaths, upper)
+			}
+		}
 	}
 
 	for _, dir := range searchPaths {
@@ -141,6 +156,9 @@ func findUKIInISO(fs filesystem.FileSystem) (string, error) {
 		}
 
 		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
 			name := strings.ToLower(entry.Name())
 			if strings.HasSuffix(name, ".efi") && strings.Contains(name, "vmlinuz") {
 				return filepath.Join(dir, entry.Name()), nil
@@ -266,13 +284,26 @@ func (s *ISOSource) extractKernelInitrdFromISO(fs filesystem.FileSystem) (*types
 	}, nil
 }
 
-// findFileInISO searches for files from a list of paths.
+// findFileInISO searches for files from a list of paths. Returned path has no
+// leading slash so it can be passed straight back into fs.OpenFile under the
+// io/fs.ValidPath rules enforced by go-diskfs v1.9+. Each path is also tried
+// upper-cased: ISO9660 without Rock Ridge folds filenames to upper case, and
+// not every Talos image is guaranteed to carry Rock Ridge extensions.
 func findFileInISO(fs filesystem.FileSystem, paths []string) string {
+	tryOpen := func(candidate string) bool {
+		f, err := fs.OpenFile(candidate, os.O_RDONLY)
+		if err != nil {
+			return false
+		}
+		f.Close()
+		return true
+	}
 	for _, path := range paths {
-		f, err := fs.OpenFile("/"+path, os.O_RDONLY)
-		if err == nil {
-			f.Close()
-			return "/" + path
+		if tryOpen(path) {
+			return path
+		}
+		if upper := strings.ToUpper(path); upper != path && tryOpen(upper) {
+			return upper
 		}
 	}
 	return ""
