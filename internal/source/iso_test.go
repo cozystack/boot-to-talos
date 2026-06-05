@@ -1,11 +1,13 @@
 package source
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cozystack/boot-to-talos/internal/testutil"
 	"github.com/cozystack/boot-to-talos/internal/types"
 )
 
@@ -188,6 +190,66 @@ func TestISOSource_GetBootAssets_InvalidPath(t *testing.T) {
 	}
 	if assets != nil {
 		t.Error("GetBootAssets should return nil assets")
+	}
+}
+
+// TestISOSource_GetBootAssets_UKI is the end-to-end regression guard for the
+// io/fs.ValidPath path stripping adopted in go-diskfs v1.9: it builds an ISO
+// containing a synthetic UKI under /EFI/BOOT/vmlinuz.efi, drives the public
+// ISOSource.GetBootAssets path, and asserts the extracted kernel/initrd/cmdline
+// match. If any step in findUKIInISO → extractUKIFromISO → uki.Extract regressed
+// for slash-handling or case-handling, this test fails before merge.
+func TestISOSource_GetBootAssets_UKI(t *testing.T) {
+	tmpDir := t.TempDir()
+	isoPath := filepath.Join(tmpDir, "test.iso")
+
+	ukiPath := filepath.Join(tmpDir, "uki.efi")
+	expectedCmdline := "console=ttyS0 talos.platform=metal"
+	expectedKernel := "test-iso-kernel-data"
+	expectedInitrd := "test-iso-initrd-data"
+
+	if err := testutil.CreateTestUKIFile(ukiPath, expectedCmdline, expectedKernel, expectedInitrd); err != nil {
+		t.Fatalf("CreateTestUKIFile: %v", err)
+	}
+	ukiContent, err := os.ReadFile(ukiPath)
+	if err != nil {
+		t.Fatalf("read UKI: %v", err)
+	}
+
+	files := map[string][]byte{
+		"/EFI/BOOT/vmlinuz.efi": ukiContent,
+	}
+	if err := testutil.CreateTestISOImage(isoPath, files); err != nil {
+		t.Fatalf("CreateTestISOImage: %v", err)
+	}
+
+	source := NewISOSource(isoPath)
+	defer source.Close()
+
+	assets, err := source.GetBootAssets()
+	if err != nil {
+		t.Fatalf("GetBootAssets: %v", err)
+	}
+	defer assets.Close()
+
+	kernelData, err := io.ReadAll(assets.Kernel)
+	if err != nil {
+		t.Fatalf("read kernel: %v", err)
+	}
+	if string(kernelData) != expectedKernel {
+		t.Errorf("kernel = %q, want %q", string(kernelData), expectedKernel)
+	}
+
+	initrdData, err := io.ReadAll(assets.Initrd)
+	if err != nil {
+		t.Fatalf("read initrd: %v", err)
+	}
+	if string(initrdData) != expectedInitrd {
+		t.Errorf("initrd = %q, want %q", string(initrdData), expectedInitrd)
+	}
+
+	if assets.Cmdline != expectedCmdline {
+		t.Errorf("cmdline = %q, want %q", assets.Cmdline, expectedCmdline)
 	}
 }
 

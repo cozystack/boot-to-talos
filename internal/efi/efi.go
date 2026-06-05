@@ -578,12 +578,12 @@ type hardDrivePath struct {
 }
 
 const (
-	dpTypeMedia       = 0x04
+	dpTypeMedia        = 0x04
 	dpSubTypeHardDrive = 0x01
-	dpSubTypeFilePath = 0x04
-	dpTypeEnd         = 0x7F
-	dpSubTypeEnd      = 0xFF
-	hardDrivePathLen  = 42 // 4-byte header + 38-byte data
+	dpSubTypeFilePath  = 0x04
+	dpTypeEnd          = 0x7F
+	dpSubTypeEnd       = 0xFF
+	hardDrivePathLen   = 42 // 4-byte header + 38-byte data
 
 	gptMBRType       = 0x02
 	gptSignatureType = 0x02

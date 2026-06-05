@@ -3,6 +3,7 @@ package source
 import (
 	"compress/gzip"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -341,15 +342,19 @@ func buildBootAssetsFromUKI(ukiTempPath, ukiTempDir, imageDir string) (assets *t
 }
 
 // findUKIFile searches for UKI file in common locations.
+// The fs parameter is the minimal directory-listing surface so callers may
+// pass either a real go-diskfs filesystem or an in-memory fake from tests.
+// Paths have no leading slash to satisfy io/fs.ValidPath semantics adopted in
+// go-diskfs v1.9. Directory entries whose name happens to end in ".efi" are
+// skipped: a directory cannot be opened as a UKI by the caller.
 func findUKIFile(fs interface {
-	ReadDir(path string) ([]os.FileInfo, error)
+	ReadDir(path string) ([]iofs.DirEntry, error)
 },
 ) (string, error) {
-	// Common UKI locations
 	searchPaths := []string{
-		"/EFI/BOOT",
-		"/EFI/boot",
-		"/efi/boot",
+		"EFI/BOOT",
+		"EFI/boot",
+		"efi/boot",
 	}
 
 	for _, dir := range searchPaths {
@@ -359,6 +364,9 @@ func findUKIFile(fs interface {
 		}
 
 		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
 			name := strings.ToLower(entry.Name())
 			if strings.HasSuffix(name, ".efi") {
 				return filepath.Join(dir, entry.Name()), nil

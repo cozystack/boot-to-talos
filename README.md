@@ -8,9 +8,9 @@ boot-to-talos supports multiple image sources:
 
 | Source Type | Example | Description |
 |-------------|---------|-------------|
-| Container | `ghcr.io/cozystack/cozystack/talos:v1.11` | Container registry images (default) |
-| ISO | `talos-v1.11.0-metal-amd64.iso` | Local ISO files |
-| RAW | `talos-v1.11.0-metal-amd64.raw.xz` | Local RAW disk images (supports .xz and .gz compression) |
+| Container | `ghcr.io/cozystack/cozystack/talos:vX.Y.Z` | Container registry images (default) |
+| ISO | `talos-vX.Y.Z-metal-amd64.iso` | Local ISO files |
+| RAW | `talos-vX.Y.Z-metal-amd64.raw.xz` | Local RAW disk images (supports .xz, .gz and .zst compression) |
 | HTTP | `https://factory.talos.dev/image/.../metal-amd64.raw.xz` | Remote ISO or RAW images |
 
 The image type is auto-detected from the file extension or URL path.
@@ -34,13 +34,13 @@ You can use official Talos factory images from [factory.talos.dev](https://facto
 
 ```console
 # Install from factory RAW image (recommended for install mode)
-boot-to-talos -yes -disk /dev/sda -image https://factory.talos.dev/image/SCHEMATIC_ID/v1.11.0/metal-amd64.raw.xz
+boot-to-talos -yes -disk /dev/sda -image https://factory.talos.dev/image/SCHEMATIC_ID/vX.Y.Z/metal-amd64.raw.xz
 
 # Install from local RAW image
-boot-to-talos -yes -disk /dev/sda -image ./talos-v1.11.0-metal-amd64.raw.xz
+boot-to-talos -yes -disk /dev/sda -image ./talos-vX.Y.Z-metal-amd64.raw.xz
 
 # Boot from local ISO
-boot-to-talos -yes -mode boot -image ./talos-v1.11.0-metal-amd64.iso
+boot-to-talos -yes -mode boot -image ./talos-vX.Y.Z-metal-amd64.iso
 ```
 
 ### Secure Boot Compatibility
@@ -98,7 +98,7 @@ Mode:
   1. boot – extract the kernel and initrd from the Talos installer and boot them directly using the kexec mechanism.
   2. install – prepare the environment, run the Talos installer, and then overwrite the system disk with the installed image.
 Mode [1]: 2
-Talos installer image [ghcr.io/cozystack/cozystack/talos:v1.10.5]:
+Talos installer image [ghcr.io/cozystack/cozystack/talos:vX.Y.Z]:
 Target disk [/dev/sda]:
 Add networking configuration? [yes]:
 Interface [eth0]:
@@ -108,7 +108,7 @@ Gateway (or 'none') [10.0.2.2]:
 Configure serial console? (or 'no') [ttyS0]:
 
 Summary:
-  Image: ghcr.io/cozystack/cozystack/talos:v1.10.5
+  Image: ghcr.io/cozystack/cozystack/talos:vX.Y.Z
   Disk:  /dev/sda
   Extra kernel args: ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0::::: console=ttyS0
 
@@ -117,12 +117,12 @@ WARNING: ALL DATA ON /dev/sda WILL BE ERASED!
 Continue? [yes]:
 
 2025/08/03 00:11:03 created temporary directory /tmp/installer-3221603450
-2025/08/03 00:11:03 pulling image ghcr.io/cozystack/cozystack/talos:v1.10.5
+2025/08/03 00:11:03 pulling image ghcr.io/cozystack/cozystack/talos:vX.Y.Z
 2025/08/03 00:11:03 extracting image layers
-2025/08/03 00:11:07 creating raw disk /tmp/installer-3221603450/image.raw (2 GiB)
+2025/08/03 00:11:07 creating raw disk /tmp/installer-3221603450/image.raw (3 GiB)
 2025/08/03 00:11:07 attached /tmp/installer-3221603450/image.raw to /dev/loop0
 2025/08/03 00:11:07 starting Talos installer
-2025/08/03 00:11:07 running Talos installer v1.10.5
+2025/08/03 00:11:07 running Talos installer vX.Y.Z
 2025/08/03 00:11:07 WARNING: config validation:
 2025/08/03 00:11:07   use "worker" instead of "" for machine type
 2025/08/03 00:11:07 created EFI (C12A7328-F81F-11D2-BA4B-00A0C93EC93B) size 104857600 bytes
@@ -137,7 +137,7 @@ Continue? [yes]:
 2025/08/03 00:11:07 copying from io reader to /boot/A/initramfs.xz
 2025/08/03 00:11:08 writing /boot/grub/grub.cfg to disk
 2025/08/03 00:11:08 executing: grub-install --boot-directory=/boot --removable --efi-directory=/boot/EFI /dev/loop0
-2025/08/03 00:11:08 installation of v1.10.5 complete
+2025/08/03 00:11:08 installation of vX.Y.Z complete
 2025/08/03 00:11:08 Talos installer finished successfully
 2025/08/03 00:11:08 remounting all filesystems read-only
 2025/08/03 00:11:08 copy /tmp/installer-3221603450/image.raw → /dev/sda
@@ -157,7 +157,7 @@ boot-to-talos -yes
 You can also specify all parameters explicitly:
 
 ```console
-boot-to-talos -yes -disk /dev/sda -image ghcr.io/cozystack/cozystack/talos:v1.10.5 -image-size-gib 4 -extra-kernel-arg "console=ttyS0"
+boot-to-talos -yes -disk /dev/sda -image ghcr.io/cozystack/cozystack/talos:vX.Y.Z -image-size-gib 4 -extra-kernel-arg "console=ttyS0"
 ```
 
 ## Available command-line flags
@@ -167,7 +167,7 @@ boot-to-talos -yes -disk /dev/sda -image ghcr.io/cozystack/cozystack/talos:v1.10
 | `-yes`                | Run non-interactively, do not ask for confirmation                 | `-yes`                                          |
 | `-mode string`        | Operation mode: `boot` or `install` (default: interactive)         | `-mode install`                                 |
 | `-disk string`        | Target disk (will be wiped, install mode only)                     | `-disk /dev/sda`                                |
-| `-image string`       | Talos image (container ref, ISO path, RAW path, or HTTP URL)       | `-image ghcr.io/cozystack/cozystack/talos:v1.11` |
+| `-image string`       | Talos image (container ref, ISO path, RAW path, or HTTP URL)       | `-image ghcr.io/cozystack/cozystack/talos:vX.Y.Z` |
 | `-image-size-gib uint`| Size of image.raw in GiB (default: 3)                              | `-image-size-gib 4`                             |
 | `-extra-kernel-arg value` | Extra kernel argument (can be repeated)                        | `-extra-kernel-arg "console=ttyS0"`             |
 | `-override-interface string` | Override the network interface used to generate the Talos kernel cmdline `ip=`/`vlan=` args (does not affect the tool's own network I/O). Pass a VLAN / bond child interface name when the netlink probe picks the wrong device, especially with `-yes`. | `-override-interface eth0.10` |
