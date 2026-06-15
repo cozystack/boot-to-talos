@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"testing"
 
@@ -13,6 +14,28 @@ import (
 
 	"github.com/cozystack/boot-to-talos/internal/cli"
 )
+
+func TestIsZeroMAC(t *testing.T) {
+	tests := []struct {
+		name string
+		mac  net.HardwareAddr
+		want bool
+	}{
+		{"nil", nil, true},
+		{"empty", net.HardwareAddr{}, true},
+		{"all zero", net.HardwareAddr{0, 0, 0, 0, 0, 0}, true},
+		{"first byte set", net.HardwareAddr{0x10, 0, 0, 0, 0, 0}, false},
+		{"last byte set", net.HardwareAddr{0, 0, 0, 0, 0, 0x01}, false},
+		{"non-zero throughout", net.HardwareAddr{0x10, 0xff, 0xe0, 0x3a, 0xd6, 0x86}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isZeroMAC(tc.mac); got != tc.want {
+				t.Errorf("isZeroMAC(%v) = %v, want %v", tc.mac, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestPickInterface(t *testing.T) {
 	tests := []struct {
