@@ -9,11 +9,26 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/errors"
+	"golang.org/x/sys/unix"
 
 	"github.com/cozystack/boot-to-talos/internal/cli"
 )
+
+// TestEthtoolIfreqSizeMatchesKernel guards against the OOB-read class of bugs
+// where Go's ethtoolIfreq is smaller than the kernel's struct ifreq. The
+// SIOCETHTOOL ioctl path copies sizeof(struct ifreq) bytes out of userspace,
+// so any future field rearrangement that shrinks ethtoolIfreq below
+// unix.Ifreq's size would let the kernel read past the allocation boundary.
+func TestEthtoolIfreqSizeMatchesKernel(t *testing.T) {
+	got := unsafe.Sizeof(ethtoolIfreq{})
+	want := unsafe.Sizeof(unix.Ifreq{})
+	if got != want {
+		t.Errorf("ethtoolIfreq size = %d, want %d (struct ifreq size); SIOCETHTOOL would read out of bounds", got, want)
+	}
+}
 
 func TestIsZeroMAC(t *testing.T) {
 	tests := []struct {

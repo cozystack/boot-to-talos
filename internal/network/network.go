@@ -632,10 +632,15 @@ func isZeroMAC(mac net.HardwareAddr) bool {
 }
 
 // ethtoolIfreq mirrors struct ifreq with the ifr_data union pointer used by
-// SIOCETHTOOL. The Name field is null-terminated and bounded by IFNAMSIZ.
+// SIOCETHTOOL. The trailing pad field is critical: the kernel copies
+// sizeof(struct ifreq) bytes out of userspace on SIOCETHTOOL, so the Go-side
+// layout must match the full kernel struct size or the syscall reads past the
+// end of the allocation. The pad width is derived from unix.Ifreq so it stays
+// correct on every architecture.
 type ethtoolIfreq struct {
 	Name [unix.IFNAMSIZ]byte
 	Data unsafe.Pointer
+	_    [unsafe.Sizeof(unix.Ifreq{}) - unix.IFNAMSIZ - unsafe.Sizeof(unsafe.Pointer(nil))]byte
 }
 
 // ethtoolPermAddrCmd mirrors struct ethtool_perm_addr from <linux/ethtool.h>.
