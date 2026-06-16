@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/jsimonetti/rtnetlink/v2"
@@ -586,17 +587,105 @@ func IfaceAddr(name string) (ip, mask string, err error) {
 }
 
 // getPermanentMAC returns the permanent (hardware) MAC address of the interface.
-// This reads from /sys/class/net/<iface>/perm_addr which contains the original
-// hardware MAC address that doesn't change even if user modifies the active MAC.
+//
+// Primary source is /sys/class/net/<iface>/perm_addr, which contains the original
+// hardware MAC that does not change when the active MAC is rewritten (most
+// notably by Linux bonding, which replaces slave MACs with the master MAC).
+//
+// Some drivers/kernels do not expose perm_addr in sysfs, or expose it as the
+// all-zero address. In both cases we fall back to the ethtool ETHTOOL_GPERMADDR
+// ioctl, which is the canonical netlink-independent way to obtain the burned-in
+// hardware address. Without this fallback, every slave of an active bond is
+// reported with the bond master's MAC, which collapses the predictable
+// enx<mac> name space and breaks the kernel bond= cmdline (both slaves end up
+// with identical names).
 func getPermanentMAC(name string) (net.HardwareAddr, error) {
+	if mac, err := readSysfsPermAddr(name); err == nil && !isZeroMAC(mac) {
+		return mac, nil
+	}
+
+	return ethtoolPermAddr(name)
+}
+
+// readSysfsPermAddr reads /sys/class/net/<name>/perm_addr. Returns the parsed
+// MAC, which may be the all-zero address when the driver does not populate it.
+func readSysfsPermAddr(name string) (net.HardwareAddr, error) {
 	path := fmt.Sprintf("/sys/class/net/%s/perm_addr", name)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	return net.ParseMAC(strings.TrimSpace(string(data)))
+}
 
-	macStr := strings.TrimSpace(string(data))
-	return net.ParseMAC(macStr)
+// isZeroMAC reports whether the address is empty or all zero bytes.
+func isZeroMAC(mac net.HardwareAddr) bool {
+	if len(mac) == 0 {
+		return true
+	}
+	for _, b := range mac {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// ethtoolIfreq mirrors struct ifreq with the ifr_data union pointer used by
+// SIOCETHTOOL. The trailing pad field is critical: the kernel copies
+// sizeof(struct ifreq) bytes out of userspace on SIOCETHTOOL, so the Go-side
+// layout must match the full kernel struct size or the syscall reads past the
+// end of the allocation. The pad width is derived from unix.Ifreq so it stays
+// correct on every architecture.
+type ethtoolIfreq struct {
+	Name [unix.IFNAMSIZ]byte
+	Data unsafe.Pointer
+	_    [unsafe.Sizeof(unix.Ifreq{}) - unix.IFNAMSIZ - unsafe.Sizeof(unsafe.Pointer(nil))]byte
+}
+
+// ethtoolPermAddrCmd mirrors struct ethtool_perm_addr from <linux/ethtool.h>.
+// MaxAddrLen (32) is the kernel-side MAX_ADDR_LEN upper bound; for Ethernet
+// interfaces Size comes back as 6.
+type ethtoolPermAddrCmd struct {
+	Cmd  uint32
+	Size uint32
+	Data [32]byte
+}
+
+// ethtoolPermAddr issues ETHTOOL_GPERMADDR via SIOCETHTOOL to fetch the
+// burned-in hardware address of the interface, bypassing any active MAC
+// override (e.g. one imposed by bonding).
+func ethtoolPermAddr(name string) (net.HardwareAddr, error) {
+	if len(name) >= unix.IFNAMSIZ {
+		return nil, errors.Newf("interface name %q exceeds IFNAMSIZ", name)
+	}
+
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, errors.Wrap(err, "ethtool: open socket")
+	}
+	defer unix.Close(fd)
+
+	cmd := ethtoolPermAddrCmd{
+		Cmd:  unix.ETHTOOL_GPERMADDR,
+		Size: uint32(len(ethtoolPermAddrCmd{}.Data)),
+	}
+	ifr := ethtoolIfreq{Data: unsafe.Pointer(&cmd)}
+	copy(ifr.Name[:], name)
+
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.SIOCETHTOOL, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
+		return nil, errors.Wrapf(errno, "ethtool: SIOCETHTOOL ETHTOOL_GPERMADDR on %s", name)
+	}
+
+	if cmd.Size == 0 || cmd.Size > uint32(len(cmd.Data)) {
+		return nil, errors.Newf("ethtool: implausible permanent address size %d on %s", cmd.Size, name)
+	}
+	mac := make(net.HardwareAddr, cmd.Size)
+	copy(mac, cmd.Data[:cmd.Size])
+	if isZeroMAC(mac) {
+		return nil, errors.Newf("ethtool: permanent address on %s is all zero", name)
+	}
+	return mac, nil
 }
 
 // macToInterfaceName converts a MAC address to a predictable interface name.

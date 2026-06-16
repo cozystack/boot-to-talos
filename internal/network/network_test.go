@@ -6,13 +6,51 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/errors"
+	"golang.org/x/sys/unix"
 
 	"github.com/cozystack/boot-to-talos/internal/cli"
 )
+
+// TestEthtoolIfreqSizeMatchesKernel guards against the OOB-read class of bugs
+// where Go's ethtoolIfreq is smaller than the kernel's struct ifreq. The
+// SIOCETHTOOL ioctl path copies sizeof(struct ifreq) bytes out of userspace,
+// so any future field rearrangement that shrinks ethtoolIfreq below
+// unix.Ifreq's size would let the kernel read past the allocation boundary.
+func TestEthtoolIfreqSizeMatchesKernel(t *testing.T) {
+	got := unsafe.Sizeof(ethtoolIfreq{})
+	want := unsafe.Sizeof(unix.Ifreq{})
+	if got != want {
+		t.Errorf("ethtoolIfreq size = %d, want %d (struct ifreq size); SIOCETHTOOL would read out of bounds", got, want)
+	}
+}
+
+func TestIsZeroMAC(t *testing.T) {
+	tests := []struct {
+		name string
+		mac  net.HardwareAddr
+		want bool
+	}{
+		{"nil", nil, true},
+		{"empty", net.HardwareAddr{}, true},
+		{"all zero", net.HardwareAddr{0, 0, 0, 0, 0, 0}, true},
+		{"first byte set", net.HardwareAddr{0x10, 0, 0, 0, 0, 0}, false},
+		{"last byte set", net.HardwareAddr{0, 0, 0, 0, 0, 0x01}, false},
+		{"non-zero throughout", net.HardwareAddr{0x10, 0xff, 0xe0, 0x3a, 0xd6, 0x86}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isZeroMAC(tc.mac); got != tc.want {
+				t.Errorf("isZeroMAC(%v) = %v, want %v", tc.mac, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestPickInterface(t *testing.T) {
 	tests := []struct {
