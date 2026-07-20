@@ -52,6 +52,59 @@ func TestIsZeroMAC(t *testing.T) {
 	}
 }
 
+// swapPermMAC swaps the injected permanent-MAC lookup for the duration of the
+// test, restoring the original via t.Cleanup. PrettyName consults it only for
+// mac-based (enx*) names, so tests can assert the recompute path without a
+// real NIC.
+func swapPermMAC(t *testing.T, fn func(string) (net.HardwareAddr, error)) {
+	t.Helper()
+	orig := permanentMACFn
+	permanentMACFn = fn
+	t.Cleanup(func() { permanentMACFn = orig })
+}
+
+// TestPrettyName pins the core invariant behind the onboard-interface fix:
+// only mac-based (enx*) names are recomputed from the permanent hardware MAC;
+// every other predictable name (onboard eno1, slot ens1, path enp2s0f0, and
+// VLAN children thereof) must reach the kernel cmdline verbatim, because that
+// is the exact name Talos assigns as primary. Rewriting eno1 into enx<mac>
+// was the regression that left the interface without networking.
+func TestPrettyName(t *testing.T) {
+	// Poison the permanent-MAC lookup: PrettyName must NOT consult it for
+	// non-mac-based names. If it does, the returned name changes and the
+	// assertions below fail loudly.
+	poison := func(string) (net.HardwareAddr, error) {
+		return net.HardwareAddr{0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}, nil
+	}
+
+	t.Run("onboard/slot/path names pass through verbatim", func(t *testing.T) {
+		swapPermMAC(t, poison)
+		for _, name := range []string{"eno1", "ens1", "enp2s0f0", "eth0", "bond0", "eno1.321"} {
+			if got := PrettyName(name); got != name {
+				t.Errorf("PrettyName(%q) = %q, want %q (must not be rewritten)", name, got, name)
+			}
+		}
+	})
+
+	t.Run("mac-based name recomputed from permanent MAC", func(t *testing.T) {
+		swapPermMAC(t, func(string) (net.HardwareAddr, error) {
+			return net.HardwareAddr{0x20, 0x67, 0x7c, 0xd4, 0xce, 0xd4}, nil
+		})
+		if got, want := PrettyName("enxaabbccddeeff"), "enx20677cd4ced4"; got != want {
+			t.Errorf("PrettyName(enx...) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("mac-based name falls back to input when perm MAC unavailable", func(t *testing.T) {
+		swapPermMAC(t, func(string) (net.HardwareAddr, error) {
+			return nil, errors.New("no perm addr")
+		})
+		if got, want := PrettyName("enx20677cd4ced4"), "enx20677cd4ced4"; got != want {
+			t.Errorf("PrettyName fallback = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestPickInterface(t *testing.T) {
 	tests := []struct {
 		name             string

@@ -697,24 +697,34 @@ func macToInterfaceName(mac net.HardwareAddr) string {
 	return "enx" + strings.ToLower(macHex)
 }
 
-// PrettyName returns the predictable network interface name based on permanent MAC address.
-// Format: enx<mac> where mac is the permanent hardware MAC address without colons.
-// This ensures the interface name remains consistent across reboots even if
-// the user has modified the active MAC address.
+// PrettyName returns the interface name that Talos will assign to the link,
+// so it can be referenced verbatim in the ip=/vlan=/bond= kernel cmdline.
+//
+// systemd/udev derives predictable names from the same net_id logic in the
+// source OS and in Talos, with a fixed priority: firmware onboard index
+// (eno1) > PCI hotplug slot (ens1) > geographical PCI path (enp2s0f0) > MAC
+// address (enx<mac>). Only the last scheme encodes the MAC into the name, so
+// only it is unstable when the active MAC is rewritten (most notably a bond
+// slave inheriting the master's MAC, which collapses every slave onto one
+// name). For every other scheme the live name is already the stable,
+// Talos-visible primary name and must pass through unchanged: rewriting eno1
+// into enx<mac> yields a name Talos never assigns as primary, so the kernel's
+// early ip=/vlan= link lookup fails and the interface never comes up.
+//
+// Therefore only mac-based names are recomputed from the permanent hardware
+// MAC (via perm_addr / ethtool), which restores distinct, stable names for
+// bond slaves whose active MAC was overwritten. All other names are returned
+// as-is.
 func PrettyName(name string) string {
-	// Try to get permanent MAC address first
-	mac, err := getPermanentMAC(name)
-	if err == nil && len(mac) > 0 {
-		return macToInterfaceName(mac)
-	}
-
-	// Fallback: try to get current MAC from interface
-	ifc, err := net.InterfaceByName(name)
-	if err != nil {
+	if !strings.HasPrefix(name, "enx") {
 		return name
 	}
-	if len(ifc.HardwareAddr) > 0 {
-		return macToInterfaceName(ifc.HardwareAddr)
+
+	// Name is MAC-based: recompute from the permanent hardware MAC so a
+	// rewritten active MAC (e.g. a bond slave) does not collapse distinct
+	// slaves onto the master's MAC.
+	if mac, err := permanentMACFn(name); err == nil && len(mac) > 0 {
+		return macToInterfaceName(mac)
 	}
 
 	return name
@@ -752,6 +762,7 @@ var (
 	defaultRouteFn       = DefaultRoute
 	ifaceAddrFn          = IfaceAddr
 	prettyNameFn         = PrettyName
+	permanentMACFn       = getPermanentMAC
 	collectNetworkInfoFn = CollectNetworkInfo
 	fatalf               = log.Fatalf
 )
