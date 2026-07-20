@@ -449,6 +449,63 @@ func TestCollectKernelArgsNetlink_OverrideRenamedVLANUsesUserName(t *testing.T) 
 	}
 }
 
+// TestCollectKernelArgsNetlink_MultiVLANSameParent proves that a second VLAN
+// on the same physical parent (a private VLAN with no default route) is picked
+// up in addition to the default-route VLAN: both get vlan=/ip= lines, and only
+// the default-route VLAN carries the gateway (a second default gateway on the
+// cmdline would be wrong).
+func TestCollectKernelArgsNetlink_MultiVLANSameParent(t *testing.T) {
+	withYes(t)
+	eno1 := LinkInfo{Name: "eno1", Index: 1, Kind: ""}
+	vlan321 := LinkInfo{Name: "vlan321", Index: 2, LinkIndex: 1, Kind: "vlan", VLAN: &VLANSpec{VID: 321, Protocol: 0x8100}}
+	vlan403 := LinkInfo{Name: "vlan403", Index: 3, LinkIndex: 1, Kind: "vlan", VLAN: &VLANSpec{VID: 403, Protocol: 0x8100}}
+	swapNetInfo(t, func() (*NetworkInfo, error) {
+		return buildNetInfo([]LinkInfo{eno1, vlan321, vlan403}), nil
+	})
+	swapFns(t,
+		// Default route via the public VLAN.
+		func() (string, string, error) { return "vlan321", "185.100.85.1", nil },
+		func(dev string) (string, string, error) {
+			switch dev {
+			case "vlan321":
+				return "185.100.85.71", "255.255.255.0", nil
+			case "vlan403":
+				return "10.100.85.71", "255.255.255.0", nil
+			}
+			return "", "", errors.New("no IPv4")
+		},
+		// Identity: keep eno1 as eno1 so the assertions read naturally.
+		func(s string) string { return s },
+	)
+
+	out := collectKernelArgsNetlink("")
+	if out == nil {
+		t.Fatal("expected cmdline, got nil")
+	}
+	joined := strings.Join(out, " ")
+
+	// Public VLAN: vlan= + ip= WITH the gateway.
+	if !strings.Contains(joined, "vlan=eno1.321:eno1") {
+		t.Errorf("missing public vlan= line: %q", joined)
+	}
+	if !strings.Contains(joined, "ip=185.100.85.71::185.100.85.1:") || !strings.Contains(joined, ":eno1.321:none") {
+		t.Errorf("public ip= line wrong or missing gateway: %q", joined)
+	}
+	// Private VLAN: vlan= + ip= WITHOUT a gateway (empty gw field).
+	if !strings.Contains(joined, "vlan=eno1.403:eno1") {
+		t.Errorf("missing private vlan= line: %q", joined)
+	}
+	if !strings.Contains(joined, "ip=10.100.85.71:::255.255.255.0:") || !strings.Contains(joined, ":eno1.403:none") {
+		t.Errorf("private ip= line wrong or should have empty gateway: %q", joined)
+	}
+	// The private VLAN must not carry the default gateway.
+	for _, a := range out {
+		if strings.Contains(a, "eno1.403") && strings.Contains(a, "185.100.85.1") {
+			t.Errorf("private VLAN must not carry default gateway: %q", a)
+		}
+	}
+}
+
 // TestCollectKernelArgsNetlink_OverrideBondSlaveNamesAreVerbatim pins the
 // bond= line slave-naming invariant on the override path: slaves go through
 // the injected prettyNameFn under no-override, but stay raw under override so
