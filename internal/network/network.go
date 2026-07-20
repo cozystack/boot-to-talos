@@ -811,6 +811,62 @@ func vlanParentName(parent, actualDevice *LinkInfo, bondName string, fromOverrid
 	return prettyNameFn(parent.Name)
 }
 
+// additionalVLANArgs builds vlan=/ip= cmdline args for every VLAN stacked on
+// the same device (actualDevice) as the already-configured default-route VLAN
+// that carries its own IPv4 address — e.g. a private VLAN with no default
+// route. Each extra VLAN gets NO gateway: only the default-route VLAN carries
+// one, a second default gateway on the kernel cmdline would be wrong. The
+// operator confirms each one (auto-accepted under -yes). processedVLANs is the
+// default-route VLAN chain, which must not be emitted again.
+func additionalVLANArgs(info *NetworkInfo, processedVLANs []*LinkInfo, actualDevice *LinkInfo, bondName, hostname string, fromOverride bool) []string {
+	seen := make(map[uint32]bool, len(processedVLANs))
+	for _, v := range processedVLANs {
+		seen[v.Index] = true
+	}
+
+	var out []string
+	for i := range info.Links {
+		cand := &info.Links[i]
+		if !cand.IsVLAN() || cand.VLAN == nil || seen[cand.Index] {
+			continue
+		}
+		// Only VLANs stacked on the same device we just configured.
+		if ResolveNetworkDevice(info, cand) != actualDevice {
+			continue
+		}
+		caddr, cmask, err := ifaceAddrFn(cand.Name)
+		if err != nil {
+			continue // no IPv4 to carry — nothing to configure
+		}
+		parentName := vlanParentName(info.GetLinkByIndex(cand.LinkIndex), actualDevice, bondName, fromOverride)
+		if !cli.AskYesNo(fmt.Sprintf("Add VLAN %d (%s)?", cand.VLAN.VID, caddr), true) {
+			continue
+		}
+		cdev := cli.Ask("Network device for IP", fmt.Sprintf("%s.%d", parentName, cand.VLAN.VID))
+		caddr = cli.Ask("IP address", caddr)
+		cmask = cli.Ask("Netmask", cmask)
+		out = append(out,
+			fmt.Sprintf("vlan=%s:%s", cdev, parentName),
+			GenerateIPCmdline(caddr, "", cmask, hostname, cdev),
+		)
+	}
+	return out
+}
+
+// consoleArg prompts for a serial console and returns the console= kernel
+// argument, or "" when the operator opts out with "no"/"none". Shared by the
+// netlink and simple collection paths.
+func consoleArg() string {
+	console := cli.Ask("Configure serial console? (or 'no')", "ttyS0")
+	if console == "" {
+		console = "ttyS0"
+	}
+	if strings.EqualFold(console, "no") || strings.EqualFold(console, "none") {
+		return ""
+	}
+	return "console=" + console
+}
+
 //nolint:gocognit,forbidigo,funlen
 func collectKernelArgsNetlink(overrideIface string) []string {
 	// Try to collect network info via netlink
@@ -999,13 +1055,13 @@ func collectKernelArgsNetlink(overrideIface string) []string {
 	ipCmdline := GenerateIPCmdline(ip, gw, mask, hostname, ipDevice)
 	out = append(out, ipCmdline)
 
+	// Additional VLANs on the same device that carry their own IPv4 address
+	// (e.g. a private VLAN with no default route) are appended with no gateway.
+	out = append(out, additionalVLANArgs(netInfo, vlans, actualDevice, bondName, hostname, fromOverride)...)
+
 	// Serial console
-	console := cli.Ask("Configure serial console? (or 'no')", "ttyS0")
-	if console == "" {
-		console = "ttyS0"
-	}
-	if !strings.EqualFold(console, "no") && !strings.EqualFold(console, "none") {
-		out = append(out, "console="+console)
+	if c := consoleArg(); c != "" {
+		out = append(out, c)
 	}
 
 	return out
@@ -1057,12 +1113,8 @@ func collectKernelArgsSimple(overrideIface string) []string {
 		out = append(out, fmt.Sprintf("ip=%s::%s:%s:%s:%s:none", ip, gw, mask, hostname, dev))
 	}
 
-	console := cli.Ask("Configure serial console? (or 'no')", "ttyS0")
-	if console == "" {
-		console = "ttyS0"
-	}
-	if !strings.EqualFold(console, "no") && !strings.EqualFold(console, "none") {
-		out = append(out, "console="+console)
+	if c := consoleArg(); c != "" {
+		out = append(out, c)
 	}
 	return out
 }
